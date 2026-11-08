@@ -57,6 +57,7 @@ static int arm_on_call;                // OOT_DUMP=when: the dump frame is set b
 static int arm_on_dispatch;            // OOT_DUMP=dispatch: the frame of the first compute dispatch (OoT: the cinematic's upscaler)
 static char arm_cs[17];                // OOT_DUMP=cs:<hex>: ... of the first dispatch of a shader whose input id starts so
 static int draws_pass = -1, in_draw_copy;   // OOT_DUMP_DRAWS=<pass>: colour target 0 copied after every draw of that pass
+static uint64_t draws_depth;                 // OOT_DUMP_DRAWS=d<addr>: ... of every pass whose depth target is at <addr>
 static int dump_vb;
 static int xfb_probe;                  // OOT_DUMP_XFB_PROBE=1: the vertex outputs of every draw of the OOT_DUMP_DRAWS pass, captured                    // OOT_DUMP_VB=1: the vertex streams of every draw of the dump frame, as guest memory holds them
 static uint32_t want_tex[16][2];       // OOT_DUMP_TEX: slot id and 0, or width and height
@@ -991,9 +992,10 @@ const char *vk_dump_dir(void) { return dir; }
 int vk_dump_pass_seq(void) { return seq; }
 
 void vk_dump_after_draw(VkExec *ex) {
-    if (in_draw_copy || draws_pass < 0) return;
+    if (in_draw_copy || (draws_pass < 0 && !draws_depth)) return;
     AcquireSRWLockExclusive(&rec_lock);
-    int go = active() && frame_now() == dump_frame && seq == draws_pass && ex->color[0].image;
+    int mine = draws_depth ? ex->depth.tex && (uint64_t)(uintptr_t)ex->depth.tex->mem == draws_depth : seq == draws_pass;
+    int go = active() && frame_now() == dump_frame && mine && ex->color[0].image;
     ReleaseSRWLockExclusive(&rec_lock);
     if (!go) return;
     in_draw_copy = 1;
@@ -1006,6 +1008,13 @@ void vk_dump_after_draw(VkExec *ex) {
         AcquireSRWLockExclusive(&rec_lock);
         const char *why = copy_out(ex, t->image, t->format, t->aspect, t->level, t->base_layer, t->width, t->height, 1, name);
         if (why) fprintf(passes_f, "draw copy %s skipped: %s\n", name, why);
+        if (ex->depth.image) {   // and the depth target, for a depth prepass whose colour the draws do not write
+            const VkExecTarget *d = &ex->depth;
+            char dname[72];
+            snprintf(dname, sizeof dname, "%s_d", name);
+            why = copy_out(ex, d->image, d->format, d->aspect, d->level, d->base_layer, d->width, d->height, 1, dname);
+            if (why) fprintf(passes_f, "draw copy %s skipped: %s\n", dname, why);
+        }
         for (int st = 0; st < 4; st++) vb_gpu_snap(ex, pass_draws - 1, st);
         ReleaseSRWLockExclusive(&rec_lock);
         vk_exec_inline_end(reopen);
@@ -1219,7 +1228,9 @@ void vk_dump_init(void) {
     const char *du = cfg_get("OOT_DUMP_UBO");
     dump_ubo = du && *du && *du != '0' ? (atoi(du) > 1 ? atoi(du) : 40) : 0;   // a number above 1: that many vec4
     const char *dd = cfg_get("OOT_DUMP_DRAWS");
-    draws_pass = dd && *dd ? atoi(dd) : -1;
+    // d<addr>: the passes by their depth target, whose numbers change from run to run as culling changes the frame
+    if (dd && *dd == 'd') draws_depth = strtoull(dd + 1, NULL, 0), draws_pass = -1;
+    else draws_pass = dd && *dd ? atoi(dd) : -1;
     const char *xp = cfg_get("OOT_DUMP_XFB_PROBE");
     xfb_probe = xp && *xp == '1';
     const char *dv = cfg_get("OOT_DUMP_VB");
