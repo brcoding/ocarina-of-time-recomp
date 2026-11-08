@@ -24,7 +24,7 @@ int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, 
 // Set by the host before any lowering (gfx_shader_set_tensor): nonzero lowers an unconditional HMMA.16816.F16 of a
 // compute program whose workgroup is whole subgroups to the translator's MMA marker (tools/xlate patch 0016), which
 // becomes a cooperative matrix multiply on the tensor cores: 1 on 16x8x16 matrices (NVIDIA), 2 on 16x16x16 ones with the
-// fragments moved between lanes (patch 0026, AMD); 0 emulates it with shuffles and half FMAs.
+// fragments moved between lanes (patch 0027, AMD); 0 emulates it with shuffles and half FMAs.
 extern int sm86_lower_tensor_cores;
 // sm86_lower with the tensor-core choice made by the caller (tensor 0, 1 or 2 instead of sm86_lower_tensor_cores).
 int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out,

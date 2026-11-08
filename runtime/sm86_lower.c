@@ -1783,7 +1783,7 @@ static void lower_hmma(L *l, const Insn *x) {
     // 0-7, Ra 8-15, Rb 20-27, Rc 39-46, which tools/xlate patch 0016 turns into a cooperative matrix multiply-add of
     // the same fragments. It reads every source before it writes, so overlaps need no copies. Only unconditional
     // ones: a matrix operation needs the whole subgroup, as HMMA itself does. Bit 48 set (tensor mode 2, vk_caps.c):
-    // the device has 16x16x16 matrices only, and patch 0026 maps the 16x8x16 product onto them.
+    // the device has 16x16x16 matrices only, and patch 0027 maps the 16x8x16 product onto them.
     int hmma_n = l->hmma_count++;   // OOT_TENSOR_HMMA_MASK=<hex> (diagnostic): only the HMMAs whose index bit is set
     const char *mask_env = getenv("OOT_TENSOR_HMMA_MASK");
     int masked = mask_env && *mask_env && hmma_n < 64 && !((strtoull(mask_env, NULL, 16) >> hmma_n) & 1);

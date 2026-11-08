@@ -45,7 +45,7 @@ approach, the order of work). Start there, with its dated Status sections: as of
 lowering covers 94.1% of the corpus, the title cinematic decodes on the host (`runtime/ov_movie22.c`, dav1d) and
 plays on screen, upscaled to 2560x1440 by the game's neural network through the emulated tensor-core instructions
 (HMMA, LDSM, MOVM); HMMA runs on the host's tensor cores (VK_KHR_cooperative_matrix, translator patch 0016; on
-AMD's 16x16x16 matrices patch 0026, `docs/phase3.md` 2026-11-08 night) and the title plays at 60 fps. The shader cache keys carry the translator identity and `KEY_VERSION`
+AMD's 16x16x16 matrices patch 0027, `docs/phase3.md` 2026-11-08 night) and the title plays at 60 fps. The shader cache keys carry the translator identity and `KEY_VERSION`
 (`gfx_shader.c`): bump the latter after a lowering change. The first run after a translator or lowering change spends
 a minute building the kernels' pipelines (the driver's disk cache keeps them). The start-up crash that killed
 about one run in two right after the first frame is fixed (`docs/phase3.md`, "the start-up crash"). Pool-indexed

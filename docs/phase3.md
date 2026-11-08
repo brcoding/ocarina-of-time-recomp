@@ -339,7 +339,7 @@ after 14.5 minutes on an RX 9060 XT). They now run on the RDNA 4 matrix cores, a
   l % 16 at rows 8 (l / 16) + e. RDNA 4's WMMA register layout. `vk_caps.c tensor_cores` measures it at every start
   (16 ms, only on devices without the 16x8x16 shape) and takes tensor mode 2 only when it matches
   (`coopmat_layout_16x16_ok`), so a device with another order stays emulated.
-- **The mapping** (translator patch 0026, `GenerateMatrixMultiplyAdd16`; the lowering sets bit 48 of the MMA marker
+- **The mapping** (translator patch 0027, `GenerateMatrixMultiplyAdd16`; the lowering sets bit 48 of the MMA marker
   in mode 2 and the IR passes the lane id). The product is computed transposed, D^T = B'' x A^T, where B'' is B^T
   padded from 8 to 16 rows by repeating rows 0-7: then every lane holds a whole row of D (lanes l and l ^ 16 the
   same one). A^T, B'' and D each cross lanes in four subgroup shuffles, each round a permutation; the per-lane choice

@@ -169,7 +169,7 @@ def main() -> int:
     ap.add_argument("--tensor", action="store_true", help="list: tensor-instruction programs only; lower/xlate: "
                                                           "HMMA on cooperative matrices (the 16x8x16 shape, NVIDIA)")
     ap.add_argument("--tensor-mode", type=int, choices=[1, 2], help="lower/xlate: 2 the 16x16x16 mapping (AMD, "
-                                                                    "tools/xlate patch 0026); 1 is --tensor")
+                                                                    "tools/xlate patch 0027); 1 is --tensor")
     ap.add_argument("--out", type=Path)
     a, rest = ap.parse_known_args()   # rest: the extract directory, or options for sm86_dis.py
     a.rest = rest

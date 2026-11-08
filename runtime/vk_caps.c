@@ -33,7 +33,7 @@
 //   2  otherwise f16 16x16x16 with f32 accumulators (AMD), if the element order measured here at every start
 //      (coopmat_probe.c coopmat_layout_measure, about 16 ms) is the one the translator's 16x16 mapping assumes, the
 //      RX 9070 XT's (RDNA 4): B and the result padded from 8 columns to 16, the fragments moved between lanes with
-//      subgroup shuffles, C added after the product in f32 (tools/xlate patch 0026, docs/phase3.md 2026-11-08). A
+//      subgroup shuffles, C added after the product in f32 (tools/xlate patch 0027, docs/phase3.md 2026-11-08). A
 //      device with another order stays emulated.
 static int tensor_cores(VkCtx *c, int sg32) {
     const char *e = cfg_get("OOT_TENSOR_CORES");
