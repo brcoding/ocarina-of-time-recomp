@@ -1219,6 +1219,23 @@ static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
     return 1;
 }
 
+// Whether an instruction's operands can name a resource variable. The scan below reads operand words as ids without
+// the SPIR-V grammar, so instructions that carry literal numbers are left out: a literal equal to a variable's id
+// counted as a use (OoT 2026-11-08: `OpConstant %int 19` beside an unused fp_c0 at %19 refused 51 fragment pipelines
+// of Kokiri Forest; over the 1,139 shaders in the cache 164 variables were taken as used so, and none of these
+// instructions uses one). Types and constants never name a variable, the composite instructions take values rather
+// than pointers, and the rest are module-level declarations and merge and switch literals.
+static int spv_op_may_use_variable(uint32_t op) {
+    switch (op) {
+    case 3: case 4: case 5: case 6: case 7: case 8: case 10: case 11: case 14: case 15: case 16: case 17:   // module level
+    case 59: case SPV_OP_DECORATE: case 72:   // OpVariable, OpDecorate, OpMemberDecorate
+    case 79: case 81: case 82:                // OpVectorShuffle, OpCompositeExtract, OpCompositeInsert
+    case 246: case 247: case 251: case 330: case 331:   // OpLoopMerge, OpSelectionMerge, OpSwitch, OpModuleProcessed,
+        return 0;                                        // OpExecutionModeId
+    }
+    return !(op >= 19 && op <= 39) && !(op >= 41 && op <= 52);   // type declarations, constants
+}
+
 // The first binding a module's resource variables use that the binding list b[0..n) lacks (module bindings >= 1 moved
 // by off), or -1. A reflection that misses a resource would otherwise hand the driver an invalid layout.
 // Only variables an instruction references count: Vulkan needs a layout binding for what the module uses
@@ -1237,8 +1254,8 @@ static int module_binding_missing(const GfxShader *s, const VkDescriptorSetLayou
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > words) break;
         if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_BINDING && w[i + 1] < bound) ref[w[i + 1]] |= 1;
-        else if (op != SPV_OP_DECORATE && op != 5 && op != 6 && op != 72 && op != 59 && op != 15 && op != 4 && op != 7)
-            for (uint32_t k = 1; k < len; k++) if (w[i + k] < bound) ref[w[i + k]] |= 2;   // every operand that is an id
+        else if (spv_op_may_use_variable(op))   // every operand that may be an id; OpExtInst's word 4 is its number
+            for (uint32_t k = op == 12 ? 5 : 1; k < len; k++) if (w[i + k] < bound) ref[w[i + k]] |= 2;
         i += len;
     }
     int missing = -1;
