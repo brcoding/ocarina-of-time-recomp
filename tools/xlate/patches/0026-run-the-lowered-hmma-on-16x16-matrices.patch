@@ -1,0 +1,194 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1161,6 +1161,11 @@
+         // OpCompositeInsert / OpCompositeExtract.
+         private static OperationResult GenerateMatrixMultiplyAdd(CodeGenContext context, AstOperation operation)
+         {
++            if (operation.SourcesCount == 9)
++            {
++                return GenerateMatrixMultiplyAdd16(context, operation);
++            }
++
+             context.UseCooperativeMatrixKhr();
+ 
+             SpvInstruction u32 = context.TypeU32();
+@@ -1206,6 +1211,150 @@
+                 SpvInstruction lo = context.CompositeExtract(f16, d, 2 * w);
+                 SpvInstruction hi = context.CompositeExtract(f16, d, 2 * w + 1);
+                 words[w] = context.Bitcast(u32, context.CompositeConstruct(v2f16, lo, hi));
++            }
++
++            SpvInstruction result = context.CompositeConstruct(context.TypeVector(u32, 2), words[0], words[1]);
++
++            return new OperationResult(AggregateType.U32 | AggregateType.Vector2, result);
++        }
++
++        // The lowered HMMA.16816.F16 on a device whose subgroup matrices are 16x16x16 only (ocarina-of-time-recomp: AMD
++        // RDNA, runtime/vk_caps.c tensor mode 2; InstEmit.Mma passes the lane id as source 8). There, measured by
++        // oot.exe --probe-coopmat and checked at every start (runtime/coopmat_probe.c coopmat_layout_16x16_ok), lane l
++        // holds as elements e = 0-7: A's row l % 16 at k = 8 (l / 16) + e; B's column l % 16 at k = 8 (l / 16) + e; the
++        // accumulator's column l % 16 at rows 8 (l / 16) + e. HMMA's fragments (lane 4g + t, PTX mma.m16n8k16) are spread
++        // otherwise, so they move between lanes: four subgroup shuffles per matrix, in each of which every lane sends one
++        // word and receives one (s is the sending lane, each round a permutation):
++        //   A: lane l's word w (elements 2w, 2w+1) is register l >> 3 of lane 4 (l & 7) + w. Round j: lane l receives
++        //      its word (j + (l >> 3)) & 3; lane s sends its register (s - j) & 3.
++        //   B: lane l's word w is register l >> 4 of lane 4 (l & 7) + w: columns 8-15 repeat columns 0-7, so the
++        //      product's columns 8-15 repeat its columns 0-7 too. Round j: lane l receives its word (j + 2 (l >> 4)) & 3;
++        //      lane s sends its register ((s - j) & 3) >> 1.
++        //   D = A x B, accumulated from zero in f32. Lane 4g + t wants D[g][2t], D[g][2t+1], D[g+8][2t], D[g+8][2t+1]
++        //      (q = 0-3): element g of lane 2t + (q & 1) + 16 (q >> 1), or of the repeat 8 lanes up. Round j: lane 4g + t
++        //      receives q = (j - g) & 3 from the copy 8 (g >> 2); lane s sends its element 4 ((s >> 3) & 1) + ((j - q_s) & 3),
++        //      q_s = (s & 1) + 2 (s >> 4).
++        // C is added to the f32 product, which is then rounded to f16 once (the tensor cores accumulate wider than f16).
++        private static OperationResult GenerateMatrixMultiplyAdd16(CodeGenContext context, AstOperation operation)
++        {
++            context.UseCooperativeMatrixKhr();
++
++            SpvInstruction u32 = context.TypeU32();
++            SpvInstruction f16 = context.TypeFloat(16);
++            SpvInstruction f32 = context.TypeFP32();
++            SpvInstruction v2f16 = context.TypeVector(f16, 2);
++            SpvInstruction v2f32 = context.TypeVector(f32, 2);
++            SpvInstruction v4u32 = context.TypeVector(u32, 4);
++            SpvInstruction v4f32 = context.TypeVector(f32, 4);
++            SpvInstruction boolType = context.TypeBool();
++            SpvInstruction scope = context.Constant(u32, (int)Scope.Subgroup);
++            SpvInstruction c16 = context.Constant(u32, 16);
++            SpvInstruction typeA = context.TypeCooperativeMatrixKHR(f16, scope, c16, c16, context.Constant(u32, 0));
++            SpvInstruction typeB = context.TypeCooperativeMatrixKHR(f16, scope, c16, c16, context.Constant(u32, 1));
++            SpvInstruction typeD = context.TypeCooperativeMatrixKHR(f32, scope, c16, c16, context.Constant(u32, 2));
++
++            SpvInstruction K(int v) => context.Constant(u32, v);
++            SpvInstruction And(SpvInstruction x, int m) => context.BitwiseAnd(u32, x, K(m));
++            SpvInstruction Shr(SpvInstruction x, int n) => context.ShiftRightLogical(u32, x, K(n));
++            SpvInstruction Shl(SpvInstruction x, int n) => context.ShiftLeftLogical(u32, x, K(n));
++            SpvInstruction Or(SpvInstruction x, SpvInstruction y) => context.BitwiseOr(u32, x, y);
++            SpvInstruction Add(SpvInstruction x, int v) => context.IAdd(u32, x, K(v));
++            SpvInstruction Sub(int v, SpvInstruction x) => context.ISub(u32, K(v), x);
++            SpvInstruction Shuffle(SpvInstruction type, SpvInstruction value, SpvInstruction lane) =>
++                context.GroupNonUniformShuffle(type, scope, value, lane);
++
++            SpvInstruction[] regs = new SpvInstruction[8];
++
++            for (int i = 0; i < 8; i++)
++            {
++                regs[i] = context.GetU32(operation.GetSource(i));
++            }
++
++            SpvInstruction lane = context.GetU32(operation.GetSource(8));
++            SpvInstruction l7x4 = Shl(And(lane, 7), 2), q3 = Shr(lane, 3), h = Shr(lane, 4), t = And(lane, 3), g = Shr(lane, 2);
++
++            // A: four words per lane, each a pair of halves in element order.
++            SpvInstruction regsA = context.CompositeConstruct(v4u32, regs[0], regs[1], regs[2], regs[3]);
++            SpvInstruction[] gotA = new SpvInstruction[4];
++
++            for (int j = 0; j < 4; j++)
++            {
++                SpvInstruction send = context.VectorExtractDynamic(u32, regsA, And(Add(t, 4 - j), 3));
++                gotA[j] = Shuffle(u32, send, Or(l7x4, And(Add(q3, j), 3)));
++            }
++
++            SpvInstruction gotAv = context.CompositeConstruct(v4u32, gotA[0], gotA[1], gotA[2], gotA[3]);
++            SpvInstruction a = context.Undef(typeA);
++
++            for (int w = 0; w < 4; w++)
++            {
++                SpvInstruction word = context.Bitcast(v2f16, context.VectorExtractDynamic(u32, gotAv, And(Sub(w, q3), 3)));
++                a = context.CompositeInsert(typeA, context.CompositeExtract(f16, word, 0), a, 2 * w);
++                a = context.CompositeInsert(typeA, context.CompositeExtract(f16, word, 1), a, 2 * w + 1);
++            }
++
++            // B: the same for its two registers.
++            SpvInstruction[] gotB = new SpvInstruction[4];
++            SpvInstruction h2 = Shl(h, 1);
++
++            for (int j = 0; j < 4; j++)
++            {
++                SpvInstruction high = context.INotEqual(boolType, Shr(And(Add(t, 4 - j), 3), 1), K(0));
++                SpvInstruction send = context.Select(u32, high, regs[5], regs[4]);
++                gotB[j] = Shuffle(u32, send, Or(l7x4, And(Add(h2, j), 3)));
++            }
++
++            SpvInstruction upper = context.INotEqual(boolType, h, K(0));
++            SpvInstruction b = context.Undef(typeB);
++
++            for (int w = 0; w < 4; w++)
++            {
++                SpvInstruction word = context.Bitcast(v2f16, context.Select(u32, upper, gotB[(w + 2) & 3], gotB[w]));
++                b = context.CompositeInsert(typeB, context.CompositeExtract(f16, word, 0), b, 2 * w);
++                b = context.CompositeInsert(typeB, context.CompositeExtract(f16, word, 1), b, 2 * w + 1);
++            }
++
++            SpvInstruction zero = context.ConstantComposite(typeD, context.Constant(f32, 0f));
++            SpvInstruction d = context.CooperativeMatrixMulAddKHR(typeD, a, b, zero);
++
++            // D: eight f32 elements per lane, one of them sent per round.
++            SpvInstruction[] el = new SpvInstruction[8];
++
++            for (int e = 0; e < 8; e++)
++            {
++                el[e] = context.CompositeExtract(f32, d, e);
++            }
++
++            SpvInstruction lo4 = context.CompositeConstruct(v4f32, el[0], el[1], el[2], el[3]);
++            SpvInstruction hi4 = context.CompositeConstruct(v4f32, el[4], el[5], el[6], el[7]);
++            SpvInstruction copy = context.INotEqual(boolType, And(lane, 8), K(0));
++            SpvInstruction qs = Or(And(lane, 1), h2);
++            SpvInstruction fromLane = Or(Shl(t, 1), Shl(Shr(g, 2), 3));
++            SpvInstruction[] gotD = new SpvInstruction[4];
++
++            for (int j = 0; j < 4; j++)
++            {
++                SpvInstruction e = And(Sub(j, qs), 3);
++                SpvInstruction send = context.Select(f32, copy, context.VectorExtractDynamic(f32, hi4, e), context.VectorExtractDynamic(f32, lo4, e));
++                SpvInstruction q = And(Sub(j, g), 3);
++                gotD[j] = Shuffle(f32, send, Or(fromLane, Or(And(q, 1), Shl(Shr(q, 1), 4))));
++            }
++
++            SpvInstruction gotDv = context.CompositeConstruct(v4f32, gotD[0], gotD[1], gotD[2], gotD[3]);
++            SpvInstruction[] dq = new SpvInstruction[4];
++
++            for (int q = 0; q < 4; q++)
++            {
++                dq[q] = context.VectorExtractDynamic(f32, gotDv, And(Add(g, q), 3));
++            }
++
++            SpvInstruction[] words = new SpvInstruction[2];
++
++            for (int w = 0; w < 2; w++)
++            {
++                SpvInstruction cw = context.FConvert(v2f32, context.Bitcast(v2f16, regs[6 + w]));
++                SpvInstruction sum = context.FAdd(v2f32, context.CompositeConstruct(v2f32, dq[2 * w], dq[2 * w + 1]), cw);
++                words[w] = context.Bitcast(u32, context.FConvert(v2f16, sum));
+             }
+ 
+             SpvInstruction result = context.CompositeConstruct(context.TypeVector(u32, 2), words[0], words[1]);
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitWarp.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitWarp.cs
+@@ -53,7 +53,14 @@
+             ulong op = context.CurrOp.RawOpCode;
+             int rd = (int)(op & 0xff), ra = (int)((op >> 8) & 0xff), rb = (int)((op >> 20) & 0xff), rc = (int)((op >> 39) & 0xff);
+ 
+-            Operand[] sources = new Operand[8];
++            // Bit 48 (ocarina-of-time-recomp runtime/sm86_lower.c lower_hmma, tensor mode 2): the device has 16x16x16
++            // matrices only, and the fragments move between lanes (GenerateMatrixMultiplyAdd16), which needs the lane id.
++            Operand[] sources = new Operand[((op >> 48) & 1) != 0 ? 9 : 8];
++
++            if (sources.Length == 9)
++            {
++                sources[8] = context.Load(StorageKind.Input, IoVariable.SubgroupLaneId);
++            }
+ 
+             for (int i = 0; i < 4; i++)
+             {
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
+@@ -114,7 +114,7 @@
+             Add(Instruction.ShiftLeft,                AggregateType.S32,    AggregateType.S32,     AggregateType.S32);
+             Add(Instruction.ShiftRightS32,            AggregateType.S32,    AggregateType.S32,     AggregateType.S32);
+             Add(Instruction.ShiftRightU32,            AggregateType.U32,    AggregateType.U32,     AggregateType.S32);
+-            Add(Instruction.MatrixMultiplyAdd,        AggregateType.U32,    AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32);
++            Add(Instruction.MatrixMultiplyAdd,        AggregateType.U32,    AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32);
+             Add(Instruction.SetMeshOutputs,           AggregateType.Void,   AggregateType.U32,     AggregateType.U32);
+             Add(Instruction.EmitMeshTasks,            AggregateType.Void,   AggregateType.U32);
+             Add(Instruction.MeshStoreVertex,          AggregateType.Void,   AggregateType.S32,     AggregateType.U32,     AggregateType.U32);

@@ -63,6 +63,8 @@ typedef struct {
     int gpl;                           // VK_EXT_graphics_pipeline_library enabled with fast linking (OOT_GPL=0: off)
     int amd;                           // an AMD GPU (vendor 0x1002), any driver
     int amd_sc;                        // AMD's Windows driver branch for RDNA 1 and 2 ("AMD proprietary shader compiler")
+    int full_subgroups;                // computeFullSubgroups (VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT)
+    int tensor;                        // how HMMA runs (vk_caps_tensor): 0 emulated, 1 16x8x16, 2 16x16x16 mapping
 } VkCaps;
 extern VkCaps vk_caps;
 void vk_caps_driver(VkPhysicalDevice p);             // first, before vkCreateDevice: vk_caps.amd, amd_sc
@@ -72,6 +74,17 @@ void vk_caps_features(VkPhysicalDeviceFeatures *f);   // before vkCreateDevice (
 int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
                 const VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT *p);
 void vk_caps_init(VkCtx *c);                          // after it: pretend limits, fallbacks, the boot report
+void vk_caps_tensor(VkCtx *c);                        // after the allocator: how HMMA runs (gfx_shader_set_tensor)
+
+// The element order of the device's 16x16 subgroup matrices (coopmat_probe.c, runtime/shaders/coopmat_layout.comp),
+// measured in one 32-lane subgroup: who[m][16 * row + column] is 16 * lane + element of the lane holding that element
+// (0xffff: none), for m = 0 A f16, 1 B f16, 2 the f16 accumulator, 3 the f32 accumulator.
+typedef struct {
+    uint32_t len[4];        // elements per lane, same order
+    uint16_t who[4][256];
+} CoopmatLayout;
+int coopmat_layout_measure(VkCtx *c, CoopmatLayout *out, const char **why);   // 0 and a reason on failure
+int coopmat_layout_16x16_ok(const CoopmatLayout *l);   // the order tools/xlate patch 0016's 16x16 mapping assumes
 
 VkCtx *vk_ctx(void);                        // NULL until vk_init() succeeded
 int vk_init(void);                          // idempotent; 1 on success, 0 on failure (reason logged with rt_log)

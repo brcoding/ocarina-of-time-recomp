@@ -12,7 +12,8 @@ tools/build_xlate.py recreates build/xlate/ryujinx from tools/vendor plus the pa
 next build: `start` right after a build, edit, `save`, then build_xlate.py (which now applies the new patch too).
 To try edits before saving, `dotnet publish` in build/xlate/xlate is what build_xlate.py runs after patching.
 The snapshot lives in build/xlate/patch-base; `start` refuses to overwrite a snapshot that has unsaved edits against
-it unless --force. Paths in the patch are a/src/... and b/src/..., as git apply --directory expects.
+it unless --force. --build DIR works on a private build (tools/build_xlate.py --out DIR) instead of build/xlate.
+Paths in the patch are a/src/... and b/src/..., as git apply --directory expects.
 """
 import argparse
 import difflib
@@ -23,7 +24,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-TREE = ROOT / "build" / "xlate" / "ryujinx"
+TREE = ROOT / "build" / "xlate" / "ryujinx"   # --build DIR: DIR/ryujinx and DIR/patch-base instead
 BASE = ROOT / "build" / "xlate" / "patch-base"
 PATCHES = ROOT / "tools" / "xlate" / "patches"
 SKIP = re.compile(r"(^|/)(bin|obj)(/|$)")
@@ -63,13 +64,17 @@ def main() -> int:
     ap.add_argument("cmd", choices=["start", "status", "diff", "save"])
     ap.add_argument("slug", nargs="?")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--build", type=Path, help="the translator build directory (tools/build_xlate.py --out), default build/xlate")
     a = ap.parse_args()
+    if a.build:
+        global TREE, BASE
+        TREE, BASE = a.build.resolve() / "ryujinx", a.build.resolve() / "patch-base"
     if a.cmd == "start":
         if BASE.exists() and changes() and not a.force:
             sys.exit("xlate_patch: the tree has edits against the current snapshot; `save` them or use --force")
         shutil.rmtree(BASE, ignore_errors=True)
         shutil.copytree(TREE / "src", BASE / "src", ignore=shutil.ignore_patterns("bin", "obj"))
-        print(f"snapshot of {TREE.relative_to(ROOT)}/src in {BASE.relative_to(ROOT)}")
+        print(f"snapshot of {TREE}/src in {BASE}")
     elif a.cmd == "status":
         for rel, x, y in changes():
             print(("added    " if not x else "removed  " if not y else "modified ") + rel)

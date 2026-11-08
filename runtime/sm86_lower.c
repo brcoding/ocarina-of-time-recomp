@@ -1782,12 +1782,14 @@ static void lower_hmma(L *l, const Insn *x) {
     // The tensor cores (2026-11-06): the translator's MMA marker, prefix 0xf7f (no Maxwell instruction uses it), Rd
     // 0-7, Ra 8-15, Rb 20-27, Rc 39-46, which tools/xlate patch 0016 turns into a cooperative matrix multiply-add of
     // the same fragments. It reads every source before it writes, so overlaps need no copies. Only unconditional
-    // ones: a matrix operation needs the whole subgroup, as HMMA itself does.
+    // ones: a matrix operation needs the whole subgroup, as HMMA itself does. Bit 48 set (tensor mode 2, vk_caps.c):
+    // the device has 16x16x16 matrices only, and patch 0026 maps the 16x8x16 product onto them.
     int hmma_n = l->hmma_count++;   // OOT_TENSOR_HMMA_MASK=<hex> (diagnostic): only the HMMAs whose index bit is set
     const char *mask_env = getenv("OOT_TENSOR_HMMA_MASK");
     int masked = mask_env && *mask_env && hmma_n < 64 && !((strtoull(mask_env, NULL, 16) >> hmma_n) & 1);
     if (l->tensor && !masked && l->pred == (uint64_t)PT << 16) {
-        emit(l, 0xf7f0000000000000ull | (uint64_t)rc << 39 | (uint64_t)rb << 20 | (uint64_t)PT << 16 | (uint64_t)ra << 8 | rd);
+        emit(l, 0xf7f0000000000000ull | (l->tensor == 2 ? 1ull << 48 : 0) | (uint64_t)rc << 39 | (uint64_t)rb << 20 |
+                    (uint64_t)PT << 16 | (uint64_t)ra << 8 | rd);
         return;
     }
     if (overlaps(rd, 2, ra, 4)) {                                 // the output reuses A's registers: A to scratch first
@@ -3217,7 +3219,10 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
     // Task and mesh programs are translated as compute (docs/mesh.md): no header in the output, addresses from 0; their
     // input still has the SM86 header.
     l.graphics = c.stage != 5 && c.stage != 6 && c.stage != 7;
-    l.tensor = tensor && !l.graphics && c.local[0] * c.local[1] * c.local[2] % 32 == 0;
+    // Mode 2 (the 16x16x16 mapping) also wants a compute program whose X size is whole subgroups: its pipeline asks for
+    // full subgroups (vk_pipeline.c compute_create), which Vulkan allows only then.
+    l.tensor = !l.graphics && c.local[0] * c.local[1] * c.local[2] % 32 == 0 &&
+                       (tensor != 2 || (c.stage == 5 && c.local[0] % 32 == 0)) ? tensor : 0;
     l.control = control, l.ctl_size = c.size, l.c1 = code + c.c1_off, l.c1_len = c.c1_len;
     uint32_t header = c.stage == 5 ? 0 : SM86_HEADER;
     l.in = (const Insn *)(code + header);

@@ -136,7 +136,7 @@ def run_game(seconds: int = 60, shot: str | None = None, env: dict | None = None
         if shot:
             shot_path = Path(shot) if Path(shot).is_absolute() else ROOT / shot
             shot_path.unlink(missing_ok=True)
-        args = [str(EXE.relative_to(ROOT)), "--seconds", str(seconds)]
+        args = [str(EXE.relative_to(ROOT) if EXE.is_relative_to(ROOT) else EXE), "--seconds", str(seconds)]
         if shot_path:
             args += ["--shot", str(shot_path.relative_to(ROOT))]
         args += extra or []
@@ -177,6 +177,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog="\n".join(__doc__.splitlines()[2:]))
     ap.add_argument("--seconds", type=int, default=60)
+    ap.add_argument("--exe", help="oot.exe of another build dir (relative to the repo), e.g. build/v131072-t2/oot.exe "
+                                  "from tools/build_game.py --out: its own shader and pipeline caches and translator")
     ap.add_argument("--shot", help="PNG path (relative to the repo) for a screenshot at the end; builds pipelines "
                                    "synchronously, so the frame does not depend on build timing")
     ap.add_argument("--press-a", action="store_true", help="press A at frame 600 (the title menu)")
@@ -194,6 +196,9 @@ def main() -> int:
     ap.add_argument("--skip-movies", action="store_true", help="end every movie after the title loop at once")
     ap.add_argument("extra", nargs="*", help="arguments for oot.exe after --")
     a = ap.parse_args()
+    if a.exe:
+        global EXE
+        EXE = ROOT / a.exe
     env = {}
     for kv in a.env:
         k, _, v = kv.partition("=")

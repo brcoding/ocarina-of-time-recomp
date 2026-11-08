@@ -57,7 +57,7 @@ uint64_t gfx_shader_async_done(void);                      // translations finis
 void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys in memory, translations done (OOT_TRACE=perf)
 // Translator answers for this device (vk_caps.c): shaderFloat64, storage offset rounding, subgroup size per vs/fs/cs.
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3]);
-void gfx_shader_set_tensor(int on);   // vk_caps.c: SM86 HMMA as cooperative matrix multiplies (sm86_lower.h)
+void gfx_shader_set_tensor(int mode);   // vk_caps.c: SM86 HMMA as cooperative matrix multiplies (sm86_lower.h), 1 or 2
 const uint8_t *gfx_shader_key(const GfxShader *s);          // the 32-byte cache key (stable while the translator is)
 const uint8_t *gfx_shader_input_id(const GfxShader *s);     // the 32-byte input id (stable across translators)
 // By input id from memory or disk; xlate 1 also translates it from its stored inputs. NULL if absent.

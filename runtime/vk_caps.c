@@ -18,22 +18,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
 
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
 #include "vk.h"
 
-// SM86 HMMA on the tensor cores (sm86_lower.c lower_hmma, tools/xlate patch 0016): VK_KHR_cooperative_matrix with
-// f16 16x8x16 subgroup matrices, half floats in shaders, and compute subgroups pinned to 32 lanes (the fragments are
-// per lane of a 32-lane warp). OOT_TENSOR_CORES=0 keeps the shuffle emulation.
+// SM86 HMMA on the tensor cores (sm86_lower.c lower_hmma, tools/xlate patch 0016): VK_KHR_cooperative_matrix, half
+// floats in shaders, and compute subgroups pinned to 32 lanes (the fragments are per lane of a 32-lane warp). Two
+// ways, by the shapes the device reports (OOT_TENSOR_CORES=0 keeps the shuffle emulation):
+//   1  f16 16x8x16 subgroup matrices with f16 accumulators (NVIDIA): HMMA's own shape, its register fragments are
+//      the matrices' elements (measured on the RTX 4070 with --probe-coopmat).
+//   2  otherwise f16 16x16x16 with f32 accumulators (AMD), if the element order measured here at every start
+//      (coopmat_probe.c coopmat_layout_measure, about 16 ms) is the one the translator's 16x16 mapping assumes, the
+//      RX 9070 XT's (RDNA 4): B and the result padded from 8 columns to 16, the fragments moved between lanes with
+//      subgroup shuffles, C added after the product in f32 (tools/xlate patch 0026, docs/phase3.md 2026-11-08). A
+//      device with another order stays emulated.
 static int tensor_cores(VkCtx *c, int sg32) {
     const char *e = cfg_get("OOT_TENSOR_CORES");
     if (e && *e && !atoi(e)) { rt_log("vk caps: tensor cores off (OOT_TENSOR_CORES=0): HMMA emulated"); return 0; }
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
     vkGetPhysicalDeviceFeatures2(c->phys, &f2);
-    int shape = 0;
+    int shape = 0, shape16 = 0;
     PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get = c->has_coopmat ?
         (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(
             c->instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR") : NULL;
@@ -42,16 +50,57 @@ static int tensor_cores(VkCtx *c, int sg32) {
     VkCooperativeMatrixPropertiesKHR *p = n ? calloc(n, sizeof *p) : NULL;
     for (uint32_t i = 0; p && i < n; i++) p[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
     if (p) get(c->phys, &n, p);
-    for (uint32_t i = 0; p && i < n; i++)
+    for (uint32_t i = 0; p && i < n; i++) {
         shape |= p[i].MSize == 16 && p[i].NSize == 8 && p[i].KSize == 16 && p[i].AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
                  p[i].BType == VK_COMPONENT_TYPE_FLOAT16_KHR && p[i].CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
                  p[i].ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR && p[i].scope == VK_SCOPE_SUBGROUP_KHR;
+        shape16 |= p[i].MSize == 16 && p[i].NSize == 16 && p[i].KSize == 16 && p[i].AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                   p[i].BType == VK_COMPONENT_TYPE_FLOAT16_KHR && p[i].CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                   p[i].ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && p[i].scope == VK_SCOPE_SUBGROUP_KHR &&
+                   !p[i].saturatingAccumulation;
+    }
     free(p);
-    int on = c->has_coopmat && shape && f12.shaderFloat16 && sg32;
-    rt_log("vk caps: tensor cores %s (cooperative matrix %d, f16 16x8x16 %d, shaderFloat16 %d, compute subgroups of 32 %d)",
-           on ? "on: HMMA as cooperative matrix multiplies" : "off: HMMA emulated", c->has_coopmat, shape,
-           (int)f12.shaderFloat16, sg32);
-    return on;
+    int base = c->has_coopmat && f12.shaderFloat16 && sg32;
+    if (base && shape) {
+        rt_log("vk caps: tensor cores on: HMMA as cooperative matrix multiplies (cooperative matrix 1, f16 16x8x16 1, "
+               "shaderFloat16 1, compute subgroups of 32 1)");
+        return 1;
+    }
+    if (base && shape16) {
+        // What the measuring shader (16-bit storage, the Vulkan memory model) and full subgroups need: the pipelines
+        // of mode 2 are created with REQUIRE_FULL_SUBGROUPS (vk_pipeline.c compute_create), as Vulkan asks of
+        // cooperative matrices in SPIR-V before 1.6, and the shuffles read lanes by number.
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &cm};
+        f12.pNext = &f11;
+        vkGetPhysicalDeviceFeatures2(c->phys, &f2);
+        if (!cm.cooperativeMatrix || !f11.storageBuffer16BitAccess || !f12.vulkanMemoryModel || !vk_caps.full_subgroups) {
+            rt_log("vk caps: tensor cores off: HMMA emulated (f16 16x16x16 matrices, but cooperativeMatrix %d, "
+                   "storageBuffer16BitAccess %d, vulkanMemoryModel %d, computeFullSubgroups %d)", (int)cm.cooperativeMatrix,
+                   (int)f11.storageBuffer16BitAccess, (int)f12.vulkanMemoryModel, vk_caps.full_subgroups);
+            return 0;
+        }
+        CoopmatLayout L;
+        const char *why = NULL;
+        ULONGLONG t0 = GetTickCount64();
+        int measured = coopmat_layout_measure(c, &L, &why), ok = measured && coopmat_layout_16x16_ok(&L);
+        if (ok) {
+            rt_log("vk caps: tensor cores on: HMMA as f16 16x16x16 cooperative matrix multiplies with f32 accumulators, "
+                   "fragments moved by subgroup shuffles (element order measured in %llu ms)", GetTickCount64() - t0);
+            return 2;
+        }
+        rt_log("vk caps: tensor cores off: HMMA emulated (f16 16x16x16 matrices, but %s; oot.exe --probe-coopmat prints it)",
+               measured ? "their element order is not the one the translator's 16x16 mapping assumes" : why);
+        return 0;
+    }
+    rt_log("vk caps: tensor cores off: HMMA emulated (cooperative matrix %d, f16 16x8x16 %d, f16 16x16x16 f32 %d, "
+           "shaderFloat16 %d, compute subgroups of 32 %d)", c->has_coopmat, shape, shape16, (int)f12.shaderFloat16, sg32);
+    return 0;
+}
+
+void vk_caps_tensor(VkCtx *c) {
+    vk_caps.tensor = tensor_cores(c, vk_caps.sg_size == 32 && (vk_caps.sg_pin_stages & VK_SHADER_STAGE_COMPUTE_BIT));
+    gfx_shader_set_tensor(vk_caps.tensor);
 }
 
 VkCaps vk_caps = {.float64 = 1, .sg_size = 32};
@@ -137,11 +186,11 @@ void vk_caps_init(VkCtx *c) {
               want <= p13.maxSubgroupSize;
     vk_caps.sg_size = want;
     vk_caps.sg_pin_stages = pin ? p13.requiredSubgroupSizeStages : 0;
+    vk_caps.full_subgroups = f13.computeFullSubgroups;   // enabled with the rest of the chain (vk_device.c)
     static const VkShaderStageFlags stage[3] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
     uint32_t told[3];
     for (int i = 0; i < 3; i++) told[i] = vk_caps.sg_pin_stages & stage[i] ? want : sg.subgroupSize;
     gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told);
-    gfx_shader_set_tensor(tensor_cores(c, want == 32 && (vk_caps.sg_pin_stages & VK_SHADER_STAGE_COMPUTE_BIT)));
 
     char dv[32];
     driver_version(dv, sizeof dv, c->props.vendorID, c->props.driverVersion);

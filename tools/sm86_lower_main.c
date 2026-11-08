@@ -32,7 +32,7 @@ static int one(const char *key, const char *ctl_path, const char *code_path, con
     unsigned char *ctl = read_file(ctl_path, &ctl_size), *code = read_file(code_path, &code_size);
     if (!ctl || !code) { printf("fail %s 0 cannot read the program files\n", key); free(ctl), free(code); return 0; }
     Sm86Lowered low;
-    sm86_lower_tensor_cores = getenv("SM86_TENSOR") && atoi(getenv("SM86_TENSOR"));   // HMMA as the MMA marker
+    sm86_lower_tensor_cores = getenv("SM86_TENSOR") ? atoi(getenv("SM86_TENSOR")) : 0;   // HMMA as the MMA marker (1, 2: vk_caps.c)
     int ok = sm86_lower(code, (uint32_t)code_size, ctl, (uint32_t)ctl_size, &low);
     if (!ok) printf("fail %s %x %s\n", key, low.error_offset, low.error);
     else if (!write_file(out_code, low.code, low.code_size) || !write_file(out_c1, low.c1, low.c1_len))

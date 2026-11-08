@@ -324,6 +324,38 @@ VK_EXT_mesh_shader (the 4070 and RX 9070 have it; a mesh execution model in the 
 programs as compute that write vertex and index buffers drawn with a pass-through vertex shader. `docs/mesh.md` is the
 hand-off for it.
 
+## Status (2026-11-08, night): HMMA on AMD's 16x16x16 matrices
+
+On the RX 9070 XT (AMD's 26.8.1 driver) the title stayed black for minutes on a first run: the upscaler's HMMAs only
+had NVIDIA's 16x8x16 shape to go to, so they were emulated into kernels of up to 3.0M SPIR-V words, and the largest
+took 181.6 s to build (compute pipelines build synchronously). They now run on the RDNA 4 matrix cores:
+
+- **What the driver offers** (`oot.exe --probe-coopmat`): only M16 N16 K16 at subgroup scope: f16 x f16 to f32 or
+  f16, 8-bit integers to s32, and fp8/bf16 forms. No 16x8x16.
+- **The element order**, measured by `runtime/shaders/coopmat_layout.comp` (each lane fills element e of each matrix
+  with 16 lane + e and stores it; the probe prints the grids), 32-lane subgroups, 8 elements per lane: A's row
+  l % 16 at k = 8 (l / 16) + e; B's column l % 16 at k = 8 (l / 16) + e; the accumulator's (f16 and f32) column
+  l % 16 at rows 8 (l / 16) + e. RDNA 4's WMMA register layout. `vk_caps.c tensor_cores` measures it at every start
+  (16 ms, only on devices without the 16x8x16 shape) and takes tensor mode 2 only when it matches
+  (`coopmat_layout_16x16_ok`), so a device with another order stays emulated.
+- **The mapping** (translator patch 0026, `GenerateMatrixMultiplyAdd16`; the lowering sets bit 48 of the MMA marker
+  in mode 2 and the IR passes the lane id): B is padded from 8 columns to 16 by repeating columns 0-7, which makes
+  the product's columns 8-15 a copy of 0-7 in the other half of the lanes. A, B and D each cross lanes in four
+  subgroup shuffles, each round a permutation with per-lane selects at both ends (the formulas are in the patch);
+  the product is accumulated from zero in f32 and C added before the one rounding to f16. HMMA's per-lane C and D
+  pairs run along a row where AMD's accumulator pairs run down a column, which would have cost eight shuffles for C
+  alone. A CPU model of the shuffles and `--probe-tensor` (LDSM, HMMA into zero and in place, against the CPU) are
+  exact. The shuffles read lanes by number, so mode 2 takes only compute programs whose X size is a multiple of 32
+  and creates their pipelines with REQUIRE_FULL_SUBGROUPS (`vk_pipeline.c compute_create`), which Vulkan asks of
+  cooperative matrices in SPIR-V before 1.6; the start-up check also wants cooperativeMatrix, 16-bit storage, the
+  Vulkan memory model (the measuring shader) and computeFullSubgroups. The NVIDIA path is unchanged: mode 1 when the
+  device has 16x8x16, and its SPIR-V for all 11 kernels is byte for byte what the translator made before. (Mode 1's
+  pipelines lack REQUIRE_FULL_SUBGROUPS too; left alone here, untested without an NVIDIA GPU.)
+- **Cost**: per HMMA 12 shuffles and about 250 SPIR-V instructions against mode 1's 40. The largest kernel
+  (5aeb2e11, 768 HMMAs) is 1.31M words in mode 2, 0.61M in mode 1 and 3.04M emulated. All 11 upscaler kernels lower
+  with every HMMA on the matrix path; spirv-val's only complaint is the VulkanMemoryModel capability (open since
+  2026-11-06).
+
 ## Status (2026-11-08, evening): the flickering level and the occlusion counts
 
 **Measuring flicker without a person.** `OOT_SHOTS=2390-2405:1 OOT_SHOTS_FULL=1 OOT_SHOTS_DIR=...` on the level

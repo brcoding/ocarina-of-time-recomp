@@ -28,6 +28,7 @@ Kill afterwards: `taskkill.exe /F /IM oot.exe /T; taskkill.exe /F /IM oot_xlate.
 
     python3 tools/kernel.py list --tensor                 # kernels, their HMMA counts and code hashes
     python3 tools/kernel.py xlate <id> --tensor           # lower + translate + spirv-val + op histogram
+    python3 tools/kernel.py xlate <id> --tensor-mode 2    # the same for the 16x16x16 mapping (AMD; OOT_XLATE=<its translator>)
     python3 tools/kernel.py extract <id> build/logs/kern/<name>
 
 Then `--probe-cs build/logs/kern/<name>` with a `bindings.txt` of `ssbo <slot> <hexsize> <file>` lines filled with
@@ -44,6 +45,7 @@ path, to find the one that differs.
     python3 tools/run.py --seconds 30 --shot build/logs/check-off.png --env OOT_TENSOR_CORES=0
     <venv>/python3 tools/shot_diff.py build/logs/check-on.png build/logs/check-off.png --out build/logs/check-side.png
 
+A private build (`tools/build_game.py --out DIR`, its translator copied next to it) runs with `--exe DIR/oot.exe`.
 `<venv>` is one with Pillow and numpy (for now `/mnt/c/dev/metroid-prime-4-recomp/.venv/bin`). A noise score
 above 1.2 is not a picture (good frames score 0.4-0.6, the broken upscaler 2.1-3.1); look at the side-by-side image
 too, since the two runs show slightly different moments of the cinematic. At 30 s the title shows its grass loop; the

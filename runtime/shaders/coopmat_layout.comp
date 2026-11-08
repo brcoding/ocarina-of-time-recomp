@@ -1,0 +1,40 @@
+// Written for ocarina-of-time-recomp (MIT, Copyright (c) 2026 Jeff Aigner).
+// The element order of the device's 16x16 subgroup matrices (runtime/coopmat_probe.c coopmat_layout_measure): one
+// 32-lane subgroup fills element e of an A, a B, an f16 and an f32 accumulator with 16 * lane + e and stores each
+// row-major. The value found at row r, column c says which lane holds that element, and as which element; the host
+// (vk_caps.c) checks it against the order the translator's 16x16 mapping of HMMA assumes (tools/xlate patch 0016).
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 32) in;
+
+layout(binding = 0, std430) buffer Buf {
+    float16_t h[768];   // A at 0, B at 256, the f16 accumulator at 512
+    float f[256];       // the f32 accumulator
+    uint len[4];        // elements per lane: A, B, f16 accumulator, f32 accumulator
+};
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> d;
+    for (int e = 0; e < a.length(); e++) a[e] = float16_t(lane * 16 + e);
+    for (int e = 0; e < b.length(); e++) b[e] = float16_t(lane * 16 + e);
+    for (int e = 0; e < c.length(); e++) c[e] = float16_t(lane * 16 + e);
+    for (int e = 0; e < d.length(); e++) d[e] = float(lane * 16 + e);
+    coopMatStore(a, h, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(b, h, 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(c, h, 512, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(d, f, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    if (lane == 0) {
+        len[0] = a.length();
+        len[1] = b.length();
+        len[2] = c.length();
+        len[3] = d.length();
+    }
+}

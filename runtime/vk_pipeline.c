@@ -944,6 +944,23 @@ static int uses_subgroup_ops(const uint32_t *w, uint64_t words) {
     return 0;
 }
 
+// True when a compute module declares CooperativeMatrixKHR and its workgroup's X size is a multiple of 32: tensor mode
+// 2 (vk_caps.c) then creates it with REQUIRE_FULL_SUBGROUPS, which Vulkan asks of cooperative matrices in SPIR-V before
+// 1.6 and which needs X a multiple of the required subgroup size. The 16x16x16 mapping's shuffles (tools/xlate patch
+// 0026) read lanes by number, so every lane must be there.
+static int coopmat_full_subgroups(const uint32_t *w, uint64_t words) {
+    int coop = 0;
+    for (uint64_t i = 5; i < words;) {
+        uint32_t op = w[i] & 0xffff, n = w[i] >> 16;
+        if (!n || i + n > words) return 0;
+        if (op == 17 && w[i + 1] == 6022) coop = 1;                            // OpCapability CooperativeMatrixKHR
+        if (op == 16 && n >= 6 && w[i + 2] == 17) return coop && w[i + 3] % 32 == 0;   // OpExecutionMode LocalSize x y z
+        if (op == 54) return 0;                                                // OpFunction: past the declarations
+        i += n;
+    }
+    return 0;
+}
+
 // Chain {size 32} into a stage create info when the stage uses subgroup ops and the driver allows the pin.
 static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *rq,
                            const uint32_t *w, uint64_t words) {
@@ -2884,6 +2901,8 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
                                       .layout = l->layout};
     pin_subgroup32(&ci.stage, &rqc, code, words);
+    if (vk_caps.tensor == 2 && ci.stage.pNext == &rqc && coopmat_full_subgroups(code, words))
+        ci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;   // mode 2 only (vk_caps.c checks the feature)
     VkPipeline pipe = VK_NULL_HANDLE;
     if (vk_trace_enabled())
         rt_log("vk_pipeline: building a compute pipeline of %llu SPIR-V words (%.1f MB) under P.lock",

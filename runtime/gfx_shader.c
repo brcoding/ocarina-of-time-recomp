@@ -56,9 +56,10 @@
 #define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 29                                      // in every cache key; bump when the key layout or the use of the
+#define KEY_VERSION 30                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids;
-                                                           // 5: NVN2 programs); translator changes are covered by its identity
+                                                           // 5: NVN2 programs; 30: HMMA on 16x16x16 matrices, sm86_lower.c
+                                                           // marker bit 48); translator changes are covered by its identity
 #define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
                                                            // or the program hash changes (drops every stored input;
                                                            // 2: the control section's own size, the whole code block)
@@ -344,17 +345,18 @@ void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgro
     rt_log("gfx_shader: host options %s: own shader cache keys", (char *)buf + 37);
 }
 
-// The tensor-core lowering (sm86_lower.h sm86_lower_tensor_cores, vk_caps.c): set before any translation; on, it is
-// mixed into the translator identity, so lowered programs that use it get their own cache keys.
-void gfx_shader_set_tensor(int on) {
+// The tensor-core lowering (sm86_lower.h sm86_lower_tensor_cores, vk_caps.c): set before any translation; on (1 the
+// 16x8x16 shape, 2 the 16x16x16 mapping), it is mixed into the translator identity, so lowered programs that use it
+// get their own cache keys.
+void gfx_shader_set_tensor(int mode) {
     paths();
-    sm86_lower_tensor_cores = on;
-    if (!on) return;
+    sm86_lower_tensor_cores = mode;
+    if (!mode) return;
     uint8_t buf[32 + 16];
     memcpy(buf, xlate_id, 32);
-    memcpy(buf + 32, "TKTC tensor=1", 13);
+    memcpy(buf + 32, mode == 2 ? "TKTC tensor=2" : "TKTC tensor=1", 13);
     rt_sha256(buf, 32 + 13, xlate_id);
-    rt_log("gfx_shader: HMMA runs on cooperative matrices: own shader cache keys");
+    rt_log("gfx_shader: HMMA runs on cooperative matrices%s: own shader cache keys", mode == 2 ? " (16x16x16 mapping)" : "");
 }
 
 // ---- the translator children
@@ -1537,7 +1539,7 @@ static int in_load(const uint8_t iid[32], Inputs *in) {
 static int tensor_for(const uint8_t *code, uint32_t len) {
     if (!sm86_lower_tensor_cores) return 0;
     const char *e = getenv("OOT_TENSOR_ONLY");
-    if (!e || !*e) return 1;
+    if (!e || !*e) return sm86_lower_tensor_cores;
     uint64_t h = 0xcbf29ce484222325ull;
     for (uint32_t i = 0; i < len; i++) h = (h ^ code[i]) * 0x100000001b3ull;
     char hex[17];
@@ -1549,7 +1551,7 @@ static int tensor_for(const uint8_t *code, uint32_t len) {
         p += n + (p[n] == ',');
     }
     rt_log("gfx_shader: OOT_TENSOR_ONLY: program %s (%u bytes): %s", hex, len, on ? "tensor cores" : "emulated");
-    return on;
+    return on ? sm86_lower_tensor_cores : 0;
 }
 
 static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,

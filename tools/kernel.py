@@ -13,11 +13,13 @@ PREFIX is the start of the input id (the <cache>/in/<id>.in name; OOT_CS_TIME an
 a path to an .in file. The code hash is the FNV-1a 64 of the SM86 code that OOT_TENSOR_ONLY matches: the id known
 when a program is translated is not always the final input id, so that switch matches the code (2026-11-06).
 --cache defaults to build/v131072/shader-cache; build/logs/sc-* (run.py --fresh-cache) are searched too.
+--tensor-mode 2 lowers and translates for the 16x16x16 mapping (AMD); OOT_XLATE names a translator other than build/xlate's.
 The sm86_lower tool is built into build/tools/ with gcc when its sources are newer.
 """
 import argparse
 import collections
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -28,7 +30,7 @@ CACHE = ROOT / "build" / "v131072" / "shader-cache"
 WINDOWS = sys.platform == "win32"   # native Windows (toolchain/msys64) rather than WSL
 TOOL = ROOT / "build" / "tools" / ("sm86_lower.exe" if WINDOWS else "sm86_lower")
 MSYS_BIN = ROOT / "toolchain" / "msys64" / "ucrt64" / "bin"
-XLATE = ROOT / "build" / "xlate" / "oot_xlate.exe"
+XLATE = Path(os.environ.get("OOT_XLATE") or ROOT / "build" / "xlate" / "oot_xlate.exe")   # OOT_XLATE: another build (as oot.exe)
 VKSDK = Path("/mnt/c/VulkanSDK")
 NAMES = {0x23c: "HMMA", 0x83b: "LDSM", 0x23a: "MOVM", 0x389: "SHFL", 0x223: "FFMA", 0x231: "HFMA2", 0x235: "HADD2",
          0x981: "LDG", 0x986: "STG", 0x984: "LDS", 0x388: "STS", 0x918: "NOP", 0x824: "IMAD", 0x810: "IADD3",
@@ -96,10 +98,10 @@ def extract(k: dict, out: Path) -> None:
     (out / "code").write_bytes(k["code"])
 
 
-def lower(k: dict, out: Path, tensor: bool) -> tuple[Path, Path]:
+def lower(k: dict, out: Path, tensor: int) -> tuple[Path, Path]:
     extract(k, out)
     low, c1 = out / f"{k['id'][:16]}.low", out / f"{k['id'][:16]}.c1"
-    env = {"SM86_TENSOR": "1" if tensor else "0", "PATH": str(MSYS_BIN) if WINDOWS else "/usr/bin:/bin"}
+    env = {"SM86_TENSOR": str(int(tensor or 0)), "PATH": str(MSYS_BIN) if WINDOWS else "/usr/bin:/bin"}
     if WINDOWS:
         env["SYSTEMROOT"] = __import__("os").environ.get("SYSTEMROOT", r"C:\Windows")
     r = subprocess.run([str(build_tool()), str(out / "ctl"), str(out / "code"), str(low), str(c1)], env=env,
@@ -121,11 +123,11 @@ def spirv_tools() -> tuple[Path | None, Path | None]:
     return bins[-1] / "spirv-val.exe", bins[-1] / "spirv-dis.exe"
 
 
-def xlate(k: dict, out: Path, tensor: bool) -> None:
+def xlate(k: dict, out: Path, tensor: int) -> None:
     if k["stage"] != "cs":
         sys.exit("kernel: xlate handles compute programs (stage cs) only")
     low, c1 = lower(k, out, tensor)
-    key = k["id"][:16] + ("-tc" if tensor else "")
+    key = k["id"][:16] + ("-tc" if tensor == 1 else f"-tc{tensor}" if tensor else "")
     jobs = out / "jobs.json"
     jobs.write_text(json.dumps([{"key": key, "stage": "cs", "code": wpath(low), "c1": c1.read_bytes().hex(),
                                  "debug": False, "local": list(k["local"] or (32, 1, 1)), "shared": k["shared"] or 0}]))
@@ -165,10 +167,13 @@ def main() -> int:
     ap.add_argument("prefix", nargs="?")
     ap.add_argument("--cache", type=Path, default=CACHE)
     ap.add_argument("--tensor", action="store_true", help="list: tensor-instruction programs only; lower/xlate: "
-                                                          "HMMA on cooperative matrices")
+                                                          "HMMA on cooperative matrices (the 16x8x16 shape, NVIDIA)")
+    ap.add_argument("--tensor-mode", type=int, choices=[1, 2], help="lower/xlate: 2 the 16x16x16 mapping (AMD, "
+                                                                    "tools/xlate patch 0026); 1 is --tensor")
     ap.add_argument("--out", type=Path)
     a, rest = ap.parse_known_args()   # rest: the extract directory, or options for sm86_dis.py
     a.rest = rest
+    mode = a.tensor_mode or (1 if a.tensor else 0)
     if a.cmd == "list":
         d = a.cache / "in"
         for p in sorted(d.glob("*.in")):
@@ -191,9 +196,9 @@ def main() -> int:
         extract(k, target)
         print(f"ctl and code in {target}")
     elif a.cmd == "lower":
-        lower(k, out, a.tensor)
+        lower(k, out, mode)
     elif a.cmd == "xlate":
-        xlate(k, out, a.tensor)
+        xlate(k, out, mode)
     elif a.cmd == "dis":
         extract(k, out)
         return subprocess.run([sys.executable, str(ROOT / "tools" / "sm86_dis.py"), str(out / "code"), "--stage",
