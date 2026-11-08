@@ -258,6 +258,9 @@ static int create_device(void) {
     if (has_ext(ep, ne, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) { g_vk.has_buffer_marker = 1; ext[n_ext++] = VK_AMD_BUFFER_MARKER_EXTENSION_NAME; }
     // NVIDIA's checkpoints, for the per-op crumbs (OOT_CRUMBS=ops): a buffer marker between draws faults there.
     if (has_ext(ep, ne, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) { g_vk.has_nv_checkpoints = 1; ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME; }
+    // OOT_CS_INFO (diagnostic): AMD's per-pipeline register, scratch and ISA report for compute pipelines; off by default.
+    const char *cs_info = cfg_get("OOT_CS_INFO");
+    if (cs_info && *cs_info && strcmp(cs_info, "0") && has_ext(ep, ne, VK_AMD_SHADER_INFO_EXTENSION_NAME)) { g_vk.has_shader_info = 1; ext[n_ext++] = VK_AMD_SHADER_INFO_EXTENSION_NAME; }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {

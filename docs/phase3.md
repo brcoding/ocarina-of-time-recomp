@@ -328,7 +328,8 @@ hand-off for it.
 
 On the RX 9070 XT (AMD's 26.8.1 driver) the title stayed black for minutes on a first run: the upscaler's HMMAs only
 had NVIDIA's 16x8x16 shape to go to, so they were emulated into kernels of up to 3.0M SPIR-V words, and the largest
-took 181.6 s to build (compute pipelines build synchronously). They now run on the RDNA 4 matrix cores:
+took 181.6 s to build (compute pipelines build synchronously; issue #9 has a 4.18M-word one that LLPC had not finished
+after 14.5 minutes on an RX 9060 XT). They now run on the RDNA 4 matrix cores, and the title plays at about 51 fps:
 
 - **What the driver offers** (`oot.exe --probe-coopmat`): only M16 N16 K16 at subgroup scope: f16 x f16 to f32 or
   f16, 8-bit integers to s32, and fp8/bf16 forms. No 16x8x16.
@@ -339,22 +340,44 @@ took 181.6 s to build (compute pipelines build synchronously). They now run on t
   (16 ms, only on devices without the 16x8x16 shape) and takes tensor mode 2 only when it matches
   (`coopmat_layout_16x16_ok`), so a device with another order stays emulated.
 - **The mapping** (translator patch 0026, `GenerateMatrixMultiplyAdd16`; the lowering sets bit 48 of the MMA marker
-  in mode 2 and the IR passes the lane id): B is padded from 8 columns to 16 by repeating columns 0-7, which makes
-  the product's columns 8-15 a copy of 0-7 in the other half of the lanes. A, B and D each cross lanes in four
-  subgroup shuffles, each round a permutation with per-lane selects at both ends (the formulas are in the patch);
-  the product is accumulated from zero in f32 and C added before the one rounding to f16. HMMA's per-lane C and D
-  pairs run along a row where AMD's accumulator pairs run down a column, which would have cost eight shuffles for C
-  alone. A CPU model of the shuffles and `--probe-tensor` (LDSM, HMMA into zero and in place, against the CPU) are
-  exact. The shuffles read lanes by number, so mode 2 takes only compute programs whose X size is a multiple of 32
-  and creates their pipelines with REQUIRE_FULL_SUBGROUPS (`vk_pipeline.c compute_create`), which Vulkan asks of
-  cooperative matrices in SPIR-V before 1.6; the start-up check also wants cooperativeMatrix, 16-bit storage, the
-  Vulkan memory model (the measuring shader) and computeFullSubgroups. The NVIDIA path is unchanged: mode 1 when the
-  device has 16x8x16, and its SPIR-V for all 11 kernels is byte for byte what the translator made before. (Mode 1's
-  pipelines lack REQUIRE_FULL_SUBGROUPS too; left alone here, untested without an NVIDIA GPU.)
-- **Cost**: per HMMA 12 shuffles and about 250 SPIR-V instructions against mode 1's 40. The largest kernel
-  (5aeb2e11, 768 HMMAs) is 1.31M words in mode 2, 0.61M in mode 1 and 3.04M emulated. All 11 upscaler kernels lower
-  with every HMMA on the matrix path; spirv-val's only complaint is the VulkanMemoryModel capability (open since
-  2026-11-06).
+  in mode 2 and the IR passes the lane id). The product is computed transposed, D^T = B'' x A^T, where B'' is B^T
+  padded from 8 to 16 rows by repeating rows 0-7: then every lane holds a whole row of D (lanes l and l ^ 16 the
+  same one). A^T, B'' and D each cross lanes in four subgroup shuffles, each round a permutation; the per-lane choice
+  of what to send and where a received word goes is one rotation by the lane's offset (eight selects) instead of a
+  select per round. The product is accumulated from zero in f32 and C added before the one rounding to f16.
+  (HMMA's C and D pairs run along a row where AMD's accumulator pairs run down a column: C through the accumulator
+  would have cost eight shuffles.) A first version computed D directly, with B's columns repeated; it needed 46-54
+  selects per HMMA against 28-29 now, and its kernels built and ran a quarter slower. A CPU model of each version's
+  shuffles and `--probe-tensor` (LDSM, HMMA into zero and in place, against the CPU) are exact.
+- **Validity**: the shuffles read lanes by number, so mode 2 takes only compute programs whose X size is a multiple
+  of 32 and creates their pipelines with REQUIRE_FULL_SUBGROUPS (`vk_pipeline.c compute_create`), which Vulkan asks
+  of cooperative matrices in SPIR-V before 1.6; the start-up check also wants cooperativeMatrix, 16-bit storage, the
+  Vulkan memory model (the measuring shader) and computeFullSubgroups. spirv-val's only complaint is the
+  VulkanMemoryModel capability (open since 2026-11-06). The NVIDIA path is unchanged: mode 1 when the device has
+  16x8x16, and its SPIR-V for all 11 kernels is byte for byte what the old lowering and translator made. (Mode 1's
+  pipelines lack REQUIRE_FULL_SUBGROUPS too; left alone, untested without an NVIDIA GPU.)
+- **Build times**, cold, in the game (`vk_pipeline: a compute pipeline of ... took`): the title's ten HMMA kernels
+  take 35.8 s together (52 s with the first version), the largest 7.8 s each (884k and 1.31M words), and c5379e8e
+  (190k words) 14.0 s. That one is the kernel's own: emulated it takes 16.6 s and spills more (`OOT_CS_INFO`, below).
+  The driver's disk cache keeps them, so this is the first run only.
+- **GPU time**: 12.3 ms of compute per frame (`OOT_CS_TIME=1`; 16.5 ms with the first version), 16.3 ms in all, so
+  the title is GPU-bound at about 51 fps (19.6 ms per frame) where the RTX 4070 reaches the 60 fps cap at 4.3 ms. The
+  top kernel, 63f42c62 (576 HMMAs in a loop), takes 2.0 ms twice a frame with 120 one-wave workgroups: it is the
+  serial chain of each wave, about 80 instructions per HMMA (the RTX 4070 runs HMMA as itself). Every big upscaler
+  kernel uses all 256 VGPRs and spills 0.1-1.4 KB to scratch.
+- **Checked**: the title's screenshots score as pictures (noise 0.45-0.49, `build/logs/amd-tc-on.png`,
+  `amd-tc-v2.png`); with four small HMMA kernels emulated (`OOT_TENSOR_ONLY` on the other eight) the picture at 30 s
+  matches the all-tensor one at 41.9 dB PSNR, a mean difference of 0.69 of 255 (`build/logs/amd-mix-side.png`;
+  frames of different moments score 18-24 dB). An all-emulated reference is not practical on this GPU.
+- **Tools added**: `OOT_CS_INFO=1` (AMD, VK_AMD_shader_info) logs every compute pipeline's VGPRs, SGPRs, scratch and
+  LDS, `=isa` also writes the disassembly to `build/logs/cs-isa-<words>.txt`; `OOT_CS_BUILD_ONLY=1` translates and
+  builds a dispatch's pipeline and records nothing, so `--probe-cs <dir>` (bindings.txt `dispatch 1 1 1`) times a
+  kernel's cold build without running it; `kernel.py --tensor-mode 2`, `run.py --exe`, `xlate_patch.py --build`.
+
+Open, for AMD: every compute program gets 48 KB of shared memory (`vk_exec_draw.c answers_for`, the NVN2 field is not
+identified), which leaves the wide one-wave kernels (c5379e8e's 5400 groups, d22b0e01, dfc7a190, 197ec50b) a couple
+of waves per WGP; the per-HMMA chain (two HMMAs sharing A in one multiply, or an f16 accumulator with C inside, whose
+D comes back in two shuffles); compute pipelines that build under `P.lock` on the replay thread (issue #9).
 
 ## Status (2026-11-08, evening): the flickering level and the occlusion counts
 

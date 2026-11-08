@@ -3380,6 +3380,12 @@ static void op_dispatch_steps(VkExec *ex, const p_dispatch *d) {
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
+    {   // OOT_CS_BUILD_ONLY=1 (diagnostic): translate and build, record nothing; with --probe-cs a kernel's cold build time
+        // and OOT_CS_INFO report without running it on stand-in data (2026-11-08, the 16x16x16 HMMA mapping)
+        static int build_only = -1;
+        if (build_only < 0) { const char *e = getenv("OOT_CS_BUILD_ONLY"); build_only = e && *e && strcmp(e, "0"); }
+        if (build_only) return;
+    }
     vk_trace_stage(22);   // barrier: ends the pass
     vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);

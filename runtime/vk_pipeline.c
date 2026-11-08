@@ -2889,6 +2889,34 @@ static void prebuild_start(void) {
 }
 
 // A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. No lock needed (P.cache is driver-synchronised).
+// OOT_CS_INFO=1 (diagnostic, AMD: VK_AMD_shader_info, vk_device.c): every compute pipeline's registers, scratch and
+// LDS as the driver compiled it, to tell a kernel that spills from one that is merely long (the 16x16x16 HMMA mapping,
+// docs/phase3.md 2026-11-08). OOT_CS_INFO=isa also writes the disassembly to build/logs/cs-isa-<words>.txt.
+static void cs_info_report(VkPipeline pipe, uint64_t words, double ms) {
+    static PFN_vkGetShaderInfoAMD get;
+    if (!get) get = (PFN_vkGetShaderInfoAMD)vkGetDeviceProcAddr(P.device, "vkGetShaderInfoAMD");
+    if (!get) return;
+    VkShaderStatisticsInfoAMD st;
+    size_t n = sizeof st;
+    if (get(P.device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_STATISTICS_AMD, &n, &st) != VK_SUCCESS) return;
+    rt_log("vk_pipeline: OOT_CS_INFO: %llu SPIR-V words, %.0f ms: vgprs %u of %u, sgprs %u of %u, scratch %zu bytes, "
+           "lds %zu bytes, workgroup %ux%ux%u", (unsigned long long)words, ms, st.resourceUsage.numUsedVgprs,
+           st.numAvailableVgprs, st.resourceUsage.numUsedSgprs, st.numAvailableSgprs,
+           st.resourceUsage.scratchMemUsageInBytes, st.resourceUsage.ldsUsageSizeInBytes, st.computeWorkGroupSize[0],
+           st.computeWorkGroupSize[1], st.computeWorkGroupSize[2]);
+    const char *e = cfg_get("OOT_CS_INFO");
+    if (!e || strcmp(e, "isa")) return;
+    size_t len = 0;
+    if (get(P.device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &len, NULL) != VK_SUCCESS || !len) return;
+    char *text = malloc(len);
+    char path[64];
+    snprintf(path, sizeof path, "build/logs/cs-isa-%llu.txt", (unsigned long long)words);
+    FILE *f = text && get(P.device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &len, text) ==
+                  VK_SUCCESS ? fopen(path, "wb") : NULL;
+    if (f) fwrite(text, 1, len, f), fclose(f), rt_log("vk_pipeline: OOT_CS_INFO: disassembly in %s", path);
+    free(text);
+}
+
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
@@ -2915,6 +2943,7 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     if (ms > 100)   // the upscaler's kernels: tens of thousands of emulated tensor-core instructions each (docs/phase3.md)
         rt_log("vk_pipeline: a compute pipeline of %llu SPIR-V words took %.0f ms to build%s", (unsigned long long)words, ms,
                pipe ? "" : " and failed");
+    if (pipe && vk_ctx()->has_shader_info) cs_info_report(pipe, words, ms);
     vkDestroyShaderModule(P.device, m, NULL);
     return pipe;
 }

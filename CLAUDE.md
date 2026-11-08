@@ -89,7 +89,9 @@ the refusals in `build/v131072/shaders/lowered.txt`.
     switch matches the code hash instead (`OOT_TENSOR_ONLY`, `tools/kernel.py` prints it).
   - `--shot` builds pipelines synchronously, so screenshot runs are slower than normal ones.
   - A relative `OOT_DUMP_DIR` or `OOT_SHADER_CACHE` is relative to the repo (run.py passes them with `/p`).
-  - `OOT_CS_TIME=1` logs the GPU time per compute shader; `OOT_TRACE=perf` the GPU time per frame and what bounds it. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the
+  - `OOT_CS_TIME=1` logs the GPU time per compute shader; `OOT_TRACE=perf` the GPU time per frame and what bounds it;
+    `OOT_CS_INFO=1` (AMD) each compute pipeline's VGPRs, scratch and LDS (`=isa` the disassembly); `OOT_CS_BUILD_ONLY=1`
+    with `--probe-cs` a kernel's cold build without running it. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the
 crash dump's memory and TLS peeks (`OOT_CRASH_PEEK`), the NVN2 logging stubs (`nvn_procs_stub.inc`),
 `build/logs/nvn-proc-got.json` (GOT slot -> proc name, from the loader at `main+0x129e290`), `--probe-tensor` and
 `--probe-cs` (a kernel in isolation), `OOT_DUMP=dispatch`, `OOT_SKIP_DISPATCH_FROM`, `OOT_MQ_LOG`, `OOT_THREAD_DUMP`.
