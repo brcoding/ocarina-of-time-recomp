@@ -515,6 +515,52 @@ static void vk_be_guest_written(uint64_t addr, uint64_t size) { vk_sync_start();
 // renders, and clears gpu_dirty only for content that is on the queue. Submissions not replayed yet render after the
 // copy, as on hardware when the GPU has not reached them; they mark the texture dirty again for a later read.
 static void vk_be_guest_read(uint64_t addr, uint64_t size) {
+    // A buffer a shader wrote: the CPU reads it right after handing the work over (the game's exposure meter: a pass
+    // adds the frame's brightness into a small buffer, the CPU reads it after an invalidate and sets it back to 0). On
+    // the console that memory is coherent; here the result reaches guest memory when its submission completes (the
+    // mirror's write-back runs before the fence signals), and the CPU read 0 or a stale sum: the exposure stepped up
+    // and down, white flashes (Hookshot's 98563eb found the same, read for behaviour only). So wait for every
+    // submission made so far. Off by default (OOT_READBACK_WAIT=1 turns it on): on the level route it turned the
+    // picture black from the Deku Tree's first words on (build/logs/rbwait-level.png, 2026-11-08), while the buffers
+    // it waited for (about 8 per frame, OOT_READBACK_LOG) read the same before and after; the CPU's resets of the
+    // meter not reaching the mirror (Hookshot's e84d467) are the suspect, not yet checked.
+    static int rb_wait = -1;
+    if (rb_wait < 0) rb_wait = cfg_get("OOT_READBACK_WAIT") && *cfg_get("OOT_READBACK_WAIT") == '1';
+    // OOT_READBACK_LOG=<n>[,<frame>] (diagnostic): the first n such reads (from that frame), words before and after
+    static int rb_log = -1;
+    static uint64_t rb_from;
+    if (rb_log < 0) {
+        const char *e = cfg_get("OOT_READBACK_LOG");
+        rb_log = e ? atoi(e) : 0;
+        rb_from = e && strchr(e, ',') ? strtoull(strchr(e, ',') + 1, NULL, 10) : 0;
+    }
+    if (rb_log > 0 && gfx_counters.frames >= rb_from && vk_gpu_wrote_pages(addr, size)) {
+        static volatile LONG n;
+        if (InterlockedIncrement(&n) <= rb_log) {
+            const uint32_t *w = (const uint32_t *)(uintptr_t)addr;
+            uint32_t b[4] = {0};
+            memcpy(b, w, size < 16 ? size : 16);
+            uint64_t f = vk_sync_latest();
+            if (rb_wait && f && vk_sync_fence_done() < f) vk_sync_fence_wait(f, UINT64_MAX);
+            rt_log("vk: readback %#llx+%#llx frame %llu (fence %llu): %08x %08x %08x %08x -> %08x %08x %08x %08x",
+                   (unsigned long long)addr, (unsigned long long)size, (unsigned long long)gfx_counters.frames,
+                   (unsigned long long)f, b[0], b[1], b[2], b[3], size > 0 ? w[0] : 0, size > 4 ? w[1] : 0,
+                   size > 8 ? w[2] : 0, size > 12 ? w[3] : 0);
+        }
+    }
+    if (rb_wait && gfx_replay_async() && vk_gpu_wrote_pages(addr, size)) {
+        uint64_t f = vk_sync_latest();
+        if (f && vk_sync_fence_done() < f) {
+            uint64_t t0 = kern_now_ns();
+            NVN_BLOCKING();
+            vk_sync_fence_wait(f, UINT64_MAX);
+            uint64_t d = kern_now_ns() - t0;
+            AcquireSRWLockExclusive(&rl);
+            dr_waits[DR_GUEST_READ]++, dr_twaits[DR_GUEST_READ]++;
+            dr_ns[DR_GUEST_READ] += d, dr_tns[DR_GUEST_READ] += d;
+            ReleaseSRWLockExclusive(&rl);
+        }
+    }
     if (!vk_texture_cpu_stale(addr, size)) return;
     vk_sync_start();
     if (gfx_replay_async()) {

@@ -1,0 +1,19 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -60,8 +60,14 @@
+         {
+             foreach ((int id, MemoryDefinition memory) in memories)
+             {
+-                SpvInstruction pointerType = context.TypePointer(storage, context.GetType(memory.Type, memory.ArrayLength));
+-                SpvInstruction variable = context.Variable(pointerType, storage);
++                SpvInstruction type = context.GetType(memory.Type, memory.ArrayLength);
++                SpvInstruction pointerType = context.TypePointer(storage, type);
++                // ocarina-of-time-recomp: local memory starts at zero, as on the console; a Private array without an
++                // initializer is undefined, and NVIDIA hands a read before the first write another lane's values
++                // (Hookshot's 08b413e and NX2navi's ee6fbaf found it, read for behaviour only).
++                SpvInstruction variable = storage == StorageClass.Private
++                    ? context.Variable(pointerType, storage, context.ConstantNull(type))
++                    : context.Variable(pointerType, storage);
+ 
+                 context.AddGlobalVariable(variable);
+ 

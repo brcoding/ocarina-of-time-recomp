@@ -1,0 +1,38 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMesh.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMesh.cs
+@@ -84,6 +84,20 @@
+             }
+         }
+ 
++        // Shared memory starts undefined in each workgroup, and a program that exits early (a meshlet or task the game
++        // culls) never writes its count: the epilogue then read the previous workgroup's count and emitted its leftover
++        // indices and vertices, long thin white triangles across the level (Hookshot's ae4fb30 found the same, read for
++        // behaviour only). The count word starts at 0: the mesh stage's primitive count, the task stage's workgroups.
++        public static void MeshPrologue(EmitterContext context)
++        {
++            ShaderDefinitions d = context.TranslatorContext.Definitions;
++            int id = context.ResourceManager.SharedMemoryId;
++            int countByte = d.MeshStage == 2 ? d.MeshBufferBase + MeshAttrBytes(d) : d.MeshBufferBase + 4;
++
++            context.Store(StorageKind.SharedMemory, id, Const(countByte >> 2), Const(0));
++            context.Barrier();
++        }
++
+         public static void MeshEpilogue(EmitterContext context)
+         {
+             ShaderDefinitions d = context.TranslatorContext.Definitions;
+--- a/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
+@@ -183,6 +183,12 @@
+                     initializationOperations = context.OperationsCount;
+                 }
+ 
++                // ocarina-of-time-recomp: task and mesh programs start from a cleared count (InstEmitMesh.MeshPrologue).
++                if (index == 0 && translatorContext.Definitions.MeshStage != 0)
++                {
++                    Instructions.InstEmit.MeshPrologue(context);
++                }
++
+                 DecodedFunction function = program.GetFunctionById(index);
+ 
+                 foreach (Block block in function.Blocks)

@@ -408,6 +408,15 @@ uint64_t vk_sync_reserve(void) {
     return v;
 }
 
+// The newest value handed out or submitted: waiting for it waits for every submission the game has made so far,
+// including those the replay has not recorded yet (fence_wait_impl lets them through).
+uint64_t vk_sync_latest(void) {
+    AcquireSRWLockShared(&st_lock);
+    uint64_t v = reserved > issued ? reserved : issued;
+    ReleaseSRWLockShared(&st_lock);
+    return v;
+}
+
 // Held by pool finalization and virtual remapping (vk_backend.c): a submission being recorded on another thread names
 // the pool's buffers until it is submitted, and the vkQueueWaitIdle of the finalization covers only submitted work.
 // FE3H's loader threads free a pool per resource while its render thread submits; in battle the GPU then drew into

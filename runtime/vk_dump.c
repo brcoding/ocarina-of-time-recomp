@@ -750,7 +750,7 @@ static uint64_t bindings_hash(const VkExec *ex, const VkPipeInfo *info) {
         const VkPipeBinding *bd = &info->bindings[i];
         if (bd->res && bd->kind == GFX_RES_SSBO) {
             int st = nvn_stage(bd->stage), slot = bd->res->slot;
-            if (slot >= 0 && slot < 32) h = (h ^ ex->ssbo[st][slot].addr) * 0x100000001b3ull;
+            if (slot >= 0 && slot < 16) h = (h ^ ex->ssbo[st][slot].addr) * 0x100000001b3ull;
             continue;
         }
         if (!bd->res || (bd->kind != GFX_RES_TEX && bd->kind != GFX_RES_IMG)) continue;
