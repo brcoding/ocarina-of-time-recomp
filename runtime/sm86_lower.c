@@ -52,6 +52,7 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
     memcpy(&c->code_size, control + 0x44, 4);
     c->stage = control[0x56];
     memcpy(c->local, control + 0x58, 12);
+    memcpy(&c->shared, control + 0x64, 4);
     if (c->size < SM86_CONTROL_MIN || c->size > control_size) c->size = SM86_CONTROL_MIN;
     uint32_t header = c->stage == 5 ? 0 : SM86_HEADER;
     if (c->stage > 7 || c->code_end <= header || c->code_end % 16 || c->c1_off < c->code_end ||
@@ -114,6 +115,7 @@ typedef struct {
     uint64_t pred;                                 // the current instruction's predicate, in Maxwell's bits 16-19
     int tensor;                                    // HMMA to the MMA marker (sm86_lower_tensor_cores, compute)
     int hmma_count;                                // HMMAs lowered so far (OOT_TENSOR_HMMA_MASK)
+    uint32_t shared_insns;                         // LDS, STS and LDSM lowered (Sm86Lowered.shared_insns)
     uint32_t index;                                // the current native instruction
     int failed;
     char error[96];
@@ -1730,6 +1732,7 @@ static int overlaps(uint32_t a, uint32_t na, uint32_t b, uint32_t nb) { return a
 static void lower_ldsm(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), offset = bits(x, 40, 24), count = 1u << bits(x, 72, 2), trans = bits(x, 78, 1);
     if (bits(x, 74, 4) || bits(x, 79, 12) || count > 4 || rd == RZ || rd + count > 255) return (void)fail(l, "LDSM mode");
+    l->shared_insns++;
     if (stub_on("ldsm")) { for (uint32_t m = 0; m < count; m++) mov_imm(l, rd + m, 0); return; }
     if (bits(x, 91, 1)) {
         uint32_t u = to_reg(l, ur_src(l, bits(x, 32, 6)), 6, 0, 0);
@@ -2556,6 +2559,7 @@ static void lower_lds_sts(L *l, const Insn *x, uint32_t op) {
     if (size > 6 || bits(x, 76, 2) || bits(x, 80, 11) || (store && bits(x, 16, 8)) || (!uniform && !store && bits(x, 32, 8)) ||
         (op == 0x988 && !uniform))
         return (void)fail(l, "shared memory access mode");
+    l->shared_insns++;
     if (stride && address != RZ) {
         emit(l, base(l, 0x3848000000000000ull, S(l, 2), address) | ((uint64_t)(stride + 1) << 20));
         address = S(l, 2);
@@ -3343,6 +3347,7 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
             out->code_size = size;
         }
     }
+    out->shared_insns = l.shared_insns;
     if (l.failed) {
         snprintf(out->error, sizeof out->error, "%s", l.error);
         out->error_offset = header + l.error_index * 16;

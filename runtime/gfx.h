@@ -42,6 +42,10 @@ typedef struct {                                           // the translator's a
     uint16_t local[3]; uint32_t shared_bytes;
     uint8_t depth_minus_w;
 } GfxShaderAnswers;
+// A compute program's shared_bytes answer: the shared memory its NVN2 control section declares (sm86_lower.h
+// Sm86Control.shared), at most 48 KB. A program with shared memory instructions that declares none gets 48 KB when
+// translated (gfx_shader.c translate_one).
+uint32_t gfx_shader_cs_shared(const uint8_t *control);
 typedef struct GfxShader GfxShader;                        // SPIR-V words + parsed reflection; owned by the cache
 const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
                                 const uint8_t *c1, const GfxShaderAnswers *a);   // blocks; NULL on failure (counted)

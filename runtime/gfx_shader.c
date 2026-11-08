@@ -56,10 +56,12 @@
 #define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 30                                      // in every cache key; bump when the key layout or the use of the
+#define KEY_VERSION 31                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids;
                                                            // 5: NVN2 programs; 30: HMMA on 16x16x16 matrices, sm86_lower.c
-                                                           // marker bit 48); translator changes are covered by its identity
+                                                           // marker bit 48; 31: compute shared memory as the control
+                                                           // declares it); translator changes are covered by its identity
+#define SHARED_MAX 0xc000u                                 // compute shared memory: Maxwell's and Vulkan's common limit
 #define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
                                                            // or the program hash changes (drops every stored input;
                                                            // 2: the control section's own size, the whole code block)
@@ -1589,7 +1591,17 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     MeshJob mj;
     int mesh = stage == GFX_STAGE_TS || stage == GFX_STAGE_MS;
     if (mesh) mesh_job(stage, control, code, a ? a->shared_bytes : 0, &mj);
-    build_request(req, hex, r->stage_name, code_path, low.c1, low.c1_len, a, &r->ctl, mesh ? &mj : NULL);
+    // A compute program with shared memory instructions whose control declares none (none of the game's, measured;
+    // a hand-made control) gets the old 48 KB rather than none, which would lose every shared store. The answers,
+    // hence the key, keep 0: the choice follows from the program alone.
+    GfxShaderAnswers wide;
+    const GfxShaderAnswers *ra = a;
+    if (stage == GFX_STAGE_CS && a && !a->shared_bytes && low.shared_insns) {
+        wide = *a, wide.shared_bytes = SHARED_MAX, ra = &wide;
+        rt_log("gfx_shader: %.16s: %u shared memory instructions and no shared memory declared: %u bytes", hex,
+               low.shared_insns, SHARED_MAX);
+    }
+    build_request(req, hex, r->stage_name, code_path, low.c1, low.c1_len, ra, &r->ctl, mesh ? &mj : NULL);
     sm86_lower_free(&low);
     int ok = svc_request(req, reply, sizeof reply);
     if (ok && strncmp(reply, "ok ", 3)) {
@@ -1967,6 +1979,14 @@ uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]) {
 
 void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local, s->local, sizeof s->local); }
 
+// Until 2026-11-08 every compute program got SHARED_MAX: the field was not known, and on AMD 48 KB a workgroup left
+// the upscaler's one-wave kernels a couple of waves per WGP (docs/phase3.md).
+uint32_t gfx_shader_cs_shared(const uint8_t *control) {
+    uint32_t v;
+    memcpy(&v, control + 0x64, 4);   // sm86_lower.h Sm86Control.shared
+    return v > SHARED_MAX ? SHARED_MAX : v;
+}
+
 // ---- answers met in play
 // The translated-shader key includes the answers a draw's state implies, so a translation made without play (the
 // census) does not match the keys play asks for. Every (program, answers) that a gfx_shader_get* call resolves is
@@ -2223,6 +2243,8 @@ static DWORD WINAPI prep_worker(void *arg) {
         const uint8_t *code = e->rec + 44 + cs;
         GfxShaderAnswers a;
         unpack_answers(r + 68, &a);
+        // Records from before KEY_VERSION 31 hold the old fixed 48 KB: answer as play does now.
+        if (st == GFX_STAGE_CS) a.shared_bytes = gfx_shader_cs_shared(control);
         const GfxShader *s = gfx_shader_get((int)st, control, code, len, NULL, &a);
         free(control);
         if (!s) InterlockedIncrement64(&p->failed);

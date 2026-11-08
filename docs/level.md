@@ -6,6 +6,11 @@ moves. The pointer design is `docs/pointers.md`, the mesh work `docs/mesh.md` an
 
 ## Where it stands (2026-11-08, main at 8535fb7)
 
+Kernel names here are input ids from before 2026-11-08's shared memory answer (`docs/phase3.md`, "compute shared
+memory as the program declares it"), which changed every compute program's id: ace1cec0 is now 726b17cb, 3f15911a
+7b872d67, 3ce2b98c a82c24ca, 745220f3 3a1c39ef, 1a62084a 8fb5a18e, e6d5432f 145fb221, 406ecfce 866197aa
+(`OOT_SKIP_CS` and `OOT_CS_TIME` use the new ones; mesh and task programs keep theirs).
+
 On the level route (`python3 tools/run.py --seconds 150 --replay build/logs/a-spam.txt --skip-movies`, no other
 settings) the game reaches the level, runs at about 59-60 fps there, and draws its geometry: the wooden structures,
 bark and moss, the ground, Navi. 0 validation errors, 0 shader failures in the boot summary (but see "Translator

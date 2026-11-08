@@ -21,7 +21,8 @@ Steps 1 to 3 of the order of work below are done; step 4 is at 86% of the corpus
 - The control section's fields are settled (the table below, columns "Reading", and `sm86_control_parse`): size at
   `+0xd4` (the BNSH archives repeat it at `+0x30` and `+0x98`, the agl packages leave those 0), instruction end at
   `+0x38`, jump-table constants at `+0x40` with their length at `+0x3c`, code size at `+0x44`, the stage at byte
-  `+0x56` (NVN's enum plus 6 task, 7 mesh), the compute workgroup size at `+0x58`; the tail past `+0xe0` holds a u32
+  `+0x56` (NVN's enum plus 6 task, 7 mesh), the compute workgroup size at `+0x58` and its shared memory in bytes at
+  `+0x64` (2026-11-08, below); the tail past `+0xe0` holds a u32
   count and 16-byte records `{BRX instruction offset, entry count, 0x10000, byte offset of the table in c1}`.
   Graphics code starts with the 0x80-byte Turing+ header, whose first 0x50 bytes are the Maxwell header the
   translator reads. The early-fragment-tests flag is not identified (candidates: `+0xa4` bits 0 and 8).
@@ -324,6 +325,67 @@ VK_EXT_mesh_shader (the 4070 and RX 9070 have it; a mesh execution model in the 
 programs as compute that write vertex and index buffers drawn with a pass-through vertex shader. `docs/mesh.md` is the
 hand-off for it.
 
+## Status (2026-11-08, late night): compute shared memory as the program declares it
+
+Every compute program used to get 48 KB of shared memory (`answers_for` in `vk_exec_draw.c`), because the NVN2 control
+section's field for it was not known. On AMD that LDS is reserved per workgroup whatever the kernel touches, so the
+upscaler's one-wave kernels ran a couple of waves per WGP. The field is control `+0x64`:
+
+- **Measured** over the census's 251 compute programs (`tools/shader_census.py`) and the 121 distinct ones play stored
+  (`build/v131072*/shader-cache/in`, the upscaler's among them; they are not in the archives): `+0x64` is 0 in
+  exactly the programs without LDS, STS or LDSM (221 of the census's, 99 of the stored ones) and non-zero in all the
+  others (30 and 22), always above the highest immediate offset they use (`0x80..0x5460`). In the census it is a
+  multiple of the workgroup size (96 x 84 = 8064, 512 x 36 = 18432, 128 x 12 = 1536), the shape of a
+  `shared float data[N][local_size]`. The only stored program with shared memory instructions and 0 there is
+  `--probe-tensor`'s hand-made kernel, whose control now says 768.
+  By hand, 197ec50b (4608 declared): its LDS addresses are `((lane >> 2) * 40 + warp) * 2 + 0x900..0xb90`, at most
+  3530 bytes; its LDSM rows `(lane & 15) * 0x90 + (lane & 16) + 0..0x60`, at most 2288 bytes. Task and mesh programs
+  use the word for something else (non-zero without shared memory instructions); they keep their own layout.
+- **Code**: `gfx_shader_cs_shared` reads it (at most 48 KB), `answers_for` answers with it, and the prepare path
+  re-answers recorded compute pairs with it (records from before hold 48 KB). `Sm86Lowered.shared_insns` counts the
+  LDS/STS/LDSM lowered: a program with some and 0 declared is translated with 48 KB and a log line (none in the
+  game). `KEY_VERSION` 31.
+- **On the RX 9070 XT** (`OOT_CS_INFO=1`): the upscaler's pipelines get 1.5-22 KB of LDS instead of 49152 bytes (the
+  driver rounds up: 2592 to 3072, 21600 to 22016). The SPIR-V is the same size, but the driver's register choice
+  changes with it: the 769,898-word kernel uses 152 VGPRs instead of 234.
+- **GPU time per dispatch** (`OOT_CS_TIME=1`, title, `--alone`, on upstream main 17b8c4b: run-65 before,
+  `build/v131072-up`, run-64 after; matched by code hash, since the input ids change):
+
+  | Kernel | Groups | Shared | Before | After |
+  |---|---|---|---|---|
+  | 63f42c62 (x2 per frame) | 120 | 4320 | 2.35 ms | 1.13 ms |
+  | c5379e8e | 5400 | 2592 | 2.62 ms | 0.67 ms |
+  | d22b0e01 | 900 | 3360 | 1.74 ms | 0.22 ms |
+  | 197ec50b | 80x180 | 4608 | 1.17 ms | 0.54 ms |
+  | dfc7a190 (x2) | 720 | 2592 | 0.94 ms | 0.18 ms |
+  | df00b2bd (x2) | 60 | 21600 | 0.70 ms | 0.73 ms |
+  | 5aeb2e11 | 85 | 3072 | 0.39 ms | 0.20 ms |
+  | 5d415995 | 8100 | 1280 | 0.23 ms | 0.04 ms |
+  | df040d44 | 70 | 5120 | 0.21 ms | 0.12 ms |
+  | baea7b2f | 97 | 3072 | 0.14 ms | 0.11 ms |
+
+  Compute per frame 14.5 ms before, 6.0 ms after; the GPU time per frame (`OOT_TRACE=perf`) 18.3 ms before, 9.4 ms
+  after, so the title goes from 30 fps (the pacer holds 30 while frames miss 60 Hz) to a steady 60. On the
+  amd-coopmat base the night before (run-20, run-21, no pacer yet): 12.35 to 6.05 ms of compute, 15.95 to 9.6 ms of
+  GPU, 52 to 60 fps. df00b2bd gains nothing: its 60 groups never filled the GPU, and the driver's register choice
+  for it spills more (1120 bytes of scratch instead of 432).
+- **Every compute program's input id changes** (the answers are part of it; the code hash does not). The ids the
+  docs use as names, old to new: the upscaler's 63f42c62 ac616599, c5379e8e 789500e3, d22b0e01 12658545,
+  dfc7a190 6f1847f8, 197ec50b e4cfcc02, df00b2bd 410807fe, 5aeb2e11 43c01576, 5d415995 c5b329fe, df040d44 fc1f969e,
+  baea7b2f 0ea2765d, e1da4ca8 8bd75830; the level's ace1cec0 726b17cb, 3f15911a 7b872d67, 3ce2b98c a82c24ca,
+  745220f3 3a1c39ef, 1a62084a 8fb5a18e, e6d5432f 145fb221, 406ecfce 866197aa. `SKIP_CS_DEFAULT` matches input ids,
+  so its kernels ran again until it named the new ones (`vk_exec_draw.c skip_cs`): 3f15911a as 7b872d67 (and
+  ace1cec0, skipped until #16, as 726b17cb); the log says "OOT_SKIP_CS: dispatches of ... skipped".
+- **Checked** on upstream main (the `verify-shader-change` skill; `--alone` runs): `--probe-tensor`,
+  `--probe-coopmat` and `--probe-vkmem` pass; the title at 30 s scores 0.46 both ways (`build/logs/lds2-title-lds.png`,
+  `lds2-title-up.png`, side by side in `lds2-title-side.png`: the same scene, the faster build already showing the
+  logo); no validation errors, no shader failures, no 48 KB fallback in any run. The level route (200 s, warm): at a
+  fixed 30 fps (`OOT_PRESENT_INTERVAL=2`) a frame every 2 s from 120 s is a good picture 41 times of 41 both ways, the
+  same scene drawn the same (`build/logs/lds2-level30-grid.png`, after over before), 11.6 ms of GPU a frame after and
+  11.9 before. With the adaptive pacer both run the level at 46-49 fps and about half the frames are the black NaN
+  frames of `docs/level.md` (19 of 41 before, 22 of 51 after): its rule (8 frames in a row over 18 ms) does not catch
+  this GPU's 14-18 ms level frames, with or without this change. The amd-coopmat base gave the same pictures.
+
 ## Status (2026-11-08, night): HMMA on AMD's 16x16x16 matrices
 
 On the RX 9070 XT (AMD's 26.8.1 driver) the title stayed black for minutes on a first run: the upscaler's HMMAs only
@@ -374,10 +436,9 @@ after 14.5 minutes on an RX 9060 XT). They now run on the RDNA 4 matrix cores, a
   builds a dispatch's pipeline and records nothing, so `--probe-cs <dir>` (bindings.txt `dispatch 1 1 1`) times a
   kernel's cold build without running it; `kernel.py --tensor-mode 2`, `run.py --exe`, `xlate_patch.py --build`.
 
-Open, for AMD: every compute program gets 48 KB of shared memory (`vk_exec_draw.c answers_for`, the NVN2 field is not
-identified), which leaves the wide one-wave kernels (c5379e8e's 5400 groups, d22b0e01, dfc7a190, 197ec50b) a couple
-of waves per WGP; the per-HMMA chain (two HMMAs sharing A in one multiply, or an f16 accumulator with C inside, whose
-D comes back in two shuffles); compute pipelines that build under `P.lock` on the replay thread (issue #9).
+Open, for AMD: the per-HMMA chain (two HMMAs sharing A in one multiply, or an f16 accumulator with C inside, whose D
+comes back in two shuffles); compute pipelines that build under `P.lock` on the replay thread (issue #9). (The 48 KB
+of shared memory every compute program got is fixed: the status above.)
 
 ## Status (2026-11-08, evening): the flickering level and the occlusion counts
 
@@ -534,6 +595,7 @@ per-dword variance. The first 0xe0 bytes are the fixed part; the block's own siz
 | `+0x40`, `+0x44` | rise with `+0x38` (`0x9e80, 0x9f00, 0xa000`) | sizes with headers, or offsets of c1 and end |
 | `+0x4c` | 150 values, `0x5a..0x60` common | register count or similar small per-shader number |
 | `+0x50..+0x60` | small flags, `0x10000` common | stage/feature flags |
+| `+0x64` | compute: 0 or `0x80..0x5460` | **compute: the shared memory the program declares**, in bytes (2026-11-08: 0 in exactly the programs without LDS/STS/LDSM, else above every immediate offset they use; in the census a multiple of the workgroup size) |
 | `+0x64..+0x70` | `0x3f800000` in a few blocks | floats (1.0f) |
 | `+0xa4` | `0x1000001` or `0x1000101` | flags |
 | `+0xbc`, `+0xc4`, `+0xc8`, `+0xd8` | `0xe0` always | size of the fixed part |
