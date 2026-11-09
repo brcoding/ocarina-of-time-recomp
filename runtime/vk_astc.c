@@ -4,7 +4,7 @@
 // ASTC textures on the GPU: the OOT_ASTC knob, a compute decoder that turns raw blocks into the RGBA8 image the CPU
 // decoder (tex_astc.c) would have written, and the native ASTC formats where the device samples them itself.
 //
-// OOT_ASTC_BC = 1 (gpu mode only; unset: on under 12 GiB of video memory, see create_bc_pipeline): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
+// OOT_ASTC_BC = 1 (gpu mode only; unset: on under 20 GiB of video memory, see create_bc_pipeline): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
 // texels to BC3 and the image is BC3, 8 bits per texel instead of 32. For GPUs with little video memory, at the cost of
 // BC3's quality: textures look slightly blockier, and data textures (normal maps) lose some precision.
 //
@@ -304,9 +304,15 @@ static int create_pipeline(VkCtx *c) {
 }
 
 // OOT_ASTC_BC=1: the BC3 encoder, when the device samples BC3 (every desktop GPU does); 0 leaves ASTC as RGBA8.
-// Unset, it is on when the largest device-local heap is under 12 GiB: OoT's levels decoded to RGBA8 outgrow an 8 GiB
+// Unset, it is on when the largest device-local heap is under 20 GiB: OoT's levels decoded to RGBA8 outgrow an 8 GiB
 // card (2026-11-08, the village after the Deku Tree: 8.6 GiB of VRAM in use against a 6.8 GiB budget, the driver paging,
-// 150 ms of GPU time a frame and 5-9 fps; with BC3 5.3 GiB, 16-23 ms and 30-34 fps on the same recorded session).
+// 150 ms of GPU time a frame and 5-9 fps; with BC3 5.3 GiB, 16-23 ms and 30-34 fps on the same recorded session), and
+// a 16 GiB one once Link is outdoors in Kokiri Forest (2026-11-09, RX 9070 XT, the walk build/logs/ak-walk.txt):
+// VRAM at its 13.2 GiB budget, textures that no longer fit go to system memory (vmaCreateImage's
+// AUTO_PREFER_DEVICE), the process's commit rises from 23 GiB to 30-32 GiB within minutes toward the system's commit
+// limit, where the AMD driver aborts inside vkAllocateDescriptorSets (0xC0000409 in amdvlk64.dll, run-123 and run-9),
+// and the GPU takes 20-28 ms a frame. With BC3 on the same walk (run-130): commit flat at 26.3 GiB for 7 minutes, the
+// GPU at 15.5-16.5 ms, a steady 30 fps (1% low 26-27 against 15-16). Cards of 20 GiB and more keep RGBA8.
 static int create_bc_pipeline(VkCtx *c) {
     const char *e = cfg_get("OOT_ASTC_BC");
     if (!e || !*e) {
@@ -315,7 +321,7 @@ static int create_bc_pipeline(VkCtx *c) {
         VkDeviceSize vram = 0;
         for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
             if ((mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[h].size > vram) vram = mp.memoryHeaps[h].size;
-        int on = vram < (12ull << 30);
+        int on = vram < (20ull << 30);
         rt_log("vk: ASTC to BC3 %s by default: %.1f GiB of video memory (OOT_ASTC_BC=0 or 1 decides)", on ? "on" : "off",
                (double)vram / (1 << 30));
         if (!on) return 0;
