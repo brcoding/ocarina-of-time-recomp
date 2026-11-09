@@ -270,3 +270,18 @@ After each change that alters what a shader computes: the `verify-shader-change`
     (1% low 26.5-27.4; predicted CPU work 10.1-10.6 + GPU 11.5 ms, 5th percentile 19.8 ms). Runs 88-94 were taken with
     `--trace perf` (as run-82), whose line every 600 presents is where the numbers above come from; run-88 had the
     window's first version (fit line 15 ms), the others the committed one.
+- 2026-11-09, night (RX 9070 XT, 16 GiB, Windows): a level run on a 16 GiB card ended with exit 0xC0000409 twice
+  (runs 9 and 123). It is the AMD driver aborting (amdvlk64.dll 32.0.31041.1004 +0x2f3d901, int 29h, fast-fail 7:
+  `abort()`) inside `vkAllocateDescriptorSets`, called from `alloc_set` (`vk_exec_draw.c`, a draw's `bind_resources`),
+  read from the WER minidumps in `%LOCALAPPDATA%\CrashDumps` with cdbX64. Why: once Link walks outdoors, the level's
+  textures, ASTC decoded to RGBA8, outgrow the 13.2 GiB VRAM budget; `vmaCreateImage` (`AUTO_PREFER_DEVICE`) then puts
+  textures in system memory, and `vkCreateImage` fails with -2 for some. The process's commit rose from 23 GiB indoors
+  to 27-32 GiB in every outdoor walk (nine runs; run-123: +4.3 GiB in the first 25 s outdoors, 30.8 GiB at the abort),
+  toward the system's commit limit (39.5 GiB on that machine: 31 GiB of RAM and an 8.6 GiB page file, shared with the
+  other programs), where the driver met an allocation it could not make. The GPU paged as well: 20-28 ms a frame
+  outdoors. The 12 GiB line of e609361 put 12 GB
+  cards such as the RTX 4070 on BC3, but not 16 GiB ones.
+  - Fix: ASTC is encoded to BC3 by default below 20 GiB of VRAM (`vk_astc.c`). The same 7-minute walk, build and pacer
+    (#19's) with BC3 (run-130 against run-123): commit flat at 26.3 GiB, the GPU at 15.5-16.5 ms a frame outdoors
+    instead of 20-28, a steady 30 fps (1% low 26-27 instead of 15-16), and 3.1% of the presents black (`OOT_DUMP_TRACE`,
+    last target all zero) instead of 27.4%. Title at 30 s with and without: both pictures (noise 0.46 and 0.47).
