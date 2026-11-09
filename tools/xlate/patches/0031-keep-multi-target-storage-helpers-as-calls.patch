@@ -1,0 +1,20 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
+@@ -137,7 +137,16 @@
+                 }
+ 
+                 SpvInstruction funcType = context.TypeFunction(retType, false, funcArgs);
+-                SpvInstruction spvFunc = context.Function(retType, FunctionControlMask.MaskNone, funcType);
++
++                // ocarina-of-time-recomp: the multi-target global memory helpers (GlobalToStorage, named
++                // "<inst>Multi_c<slot>o<offset>..."), above all patch 0022's search of the 16-entry storage table, are
++                // called once per access: up to 253 times in one of the game's fragment shaders. Inlined, NVIDIA's
++                // driver took 78-155 s to build each such fragment stage (Forest Temple, RTX 5070); kept as calls,
++                // under 0.5 s. DontInline only changes how the driver compiles them, not what they compute.
++                FunctionControlMask control = funcIndex != 0 && function.Name != null && function.Name.Contains("Multi_c")
++                    ? FunctionControlMask.DontInline
++                    : FunctionControlMask.MaskNone;
++                SpvInstruction spvFunc = context.Function(retType, control, funcType);
+ 
+                 context.DeclareFunction(funcIndex, function, spvFunc);
+             }
