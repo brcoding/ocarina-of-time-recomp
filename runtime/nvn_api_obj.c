@@ -844,55 +844,149 @@ NVN_API(nvnWindowSetCrop) {
 // 2026-11-08; OOT_DUMP_TRACE showed the NaN first in Link's layer, every other frame). At a steady 60 or 30 fps there
 // are none: OOT_GPU_AHEAD=0 (about 13 fps) and a fixed interval of 2 both remove them (0 of 53 shots). Hookshot finds
 // the same frame-rate dependence (its "dark frames", none at 33 fps; read for behaviour only). So the pacer holds
-// whole frame rates: when the game's work keeps missing a 60 Hz frame (AP_UP_N frames in a row over AP_UP_MS), it
-// paces at interval 2 (30 fps, as a console game that cannot hold 60 shows every frame for two vsyncs); when the
-// average work fits well inside one tick again (AP_DOWN_MS over AP_DOWN_N frames), back to the game's interval.
-// Work is the time between presents less what the acquires waited (the pacer and the GPU bound). OOT_PRESENT_INTERVAL:
-// unset or "auto" adaptive, 0 the game's interval always, n > 0 that many ticks always.
-#define AP_UP_MS 18.0
-#define AP_UP_N 8
-#define AP_DOWN_MS 13.0
-#define AP_DOWN_N 180
+// whole frame rates: 60 fps, or interval 2 (30 fps, as a console game that cannot hold 60 shows every frame for two
+// vsyncs) while frames miss 60. It decides from the share of such frames in a sliding window of AP_WIN frames:
+// - At 60, a frame's cost is the time since the previous present less what its acquire slept for the pacer; the
+//   acquire's GPU fence wait counts, so a GPU-bound frame misses too. AP_UP_N of the window's frames over AP_MISS_MS
+//   (one tick and a margin for timer jitter): pace at 30.
+// - At 30 that cost hides in the slack, so the pacer predicts what the frame would cost at 60: its CPU work (the time
+//   since the previous present less every acquire wait) plus its GPU time (timestamps, vk_sync.c, averaged over the
+//   last AP_GPU_N presents). The two barely overlap in this game: at 60 on the level the CPU waits for GPU fences
+//   about 9.6 ms of each 20 ms frame (perf line, run-82). The prediction is high (the GPU also reads about 10% slower
+//   at 30 than at 60 on the title), so AP_FIT_MS sits close to a tick. Back to 60 when a full window has at most
+//   AP_DOWN_N frames predicted over AP_FIT_MS and the pacer has held 30 for ap_hold_ns.
+// - The hold starts at AP_HOLD_S; when frames miss again within AP_RETRY_S of a return to 60 (a scene the prediction
+//   gets wrong), the next hold doubles, up to AP_HOLD_MAX_S, so a wrong prediction costs a second of uneven frames
+//   once per hold, not a flip every few seconds.
+// The first rule (8 frames in a row over 18 ms of CPU work, back after 180 frames under 13 ms on average) saw neither
+// GPU time nor a miss every other frame: on the RX 9070 XT it flipped between 30 and 60 on the level, whose frames
+// at 60 take 14-38 ms (about 20 on average, CPU work 10-12 ms at 30), and left it at an uneven 46-49 fps with about
+// half the frames black (19 of 41 shots, build/logs/run-82.log); it flipped the title too (CPU work 2 ms, GPU 18 ms).
+// With this rule on the same GPU (docs/level.md, 2026-11-09): the level holds 30 fps, 0 black of 41 shots, every frame
+// predicted over AP_FIT_MS (CPU work 10 + GPU 12.6 ms; run-88); the title runs at 60 with the shared-memory commit
+// (CPU work 2.2 + GPU 9.4 ms; run-90) and holds 30 without it (predicted 20 ms; run-92).
+// OOT_PRESENT_INTERVAL: unset or "auto" adaptive, 0 the game's interval always, n > 0 that many ticks always.
+// OOT_TRACE=perf adds a line every AP_LOG_N presents with both measures and their percentiles, in every mode.
+#define AP_WIN 120          // frames in the window: 2 s at 60 fps, 4 s at 30
+#define AP_MISS_MS 17.5     // at 60: a frame that cost more missed its tick (16.7 ms and 5%)
+#define AP_UP_N 12          // misses in the window that switch to 30 (10%)
+#define AP_FIT_MS 16.0      // at 30: a frame predicted under this fits 60 (96% of a tick)
+#define AP_DOWN_N 6         // frames of a full window predicted over AP_FIT_MS that still allow 60 (5%)
+#define AP_GPU_N 8          // presents the GPU time is averaged over (it is counted at completion, not per frame)
+#define AP_HOLD_S 5
+#define AP_RETRY_S 10
+#define AP_HOLD_MAX_S 320
+#define AP_LOG_N 600
+#define AP_S 1000000000ull
 static int ap_mode = -2;                 // -1 adaptive, 0 the game's interval, n > 0 fixed
-static int ap_ticks = 1, ap_streak;      // adaptive: the interval paced at, frames in a row that argue for a change
-static uint64_t ap_last_present;
-static volatile LONG64 ap_wait_ns;       // acquire waits since the last present
-static double ap_work_ema;
+static int ap_ticks = 1;                 // adaptive: the interval paced at
+static uint64_t ap_last_present, ap_switched, ap_hold_ns = AP_HOLD_S * AP_S;   // last change of interval, hold at 30
+static volatile LONG64 ap_wait_ns, ap_sleep_ns;   // acquire waits since the last present, and the pacer's sleep in them
+static uint64_t ap_gpu_tot[AP_GPU_N];    // perf_gpu_busy_total at the last AP_GPU_N presents
+static unsigned ap_gpu_pos, ap_gpu_n;
+// The window: per frame whether it argues for the other rate, and the measures for the log line at a change.
+static struct { uint8_t bad; float cost, work, gpu; } ap_win[AP_WIN];
+static int ap_pos, ap_n, ap_nbad;
+static double ap_sum_cost, ap_sum_work, ap_sum_gpu;
+// OOT_TRACE=perf: since the last line, with each frame's cost and prediction for the percentiles.
+static struct { unsigned n, miss, over; double cost, work, gpu; float c[AP_LOG_N], p[AP_LOG_N]; } ap_log;
+
+static int ap_cmp(const void *a, const void *b) {
+    float x = *(const float *)a, y = *(const float *)b;
+    return (x > y) - (x < y);
+}
+
+// The p-th percentile of n values, sorted in place.
+static double ap_pct(float *v, unsigned n, double p) {
+    qsort(v, n, sizeof *v, ap_cmp);
+    unsigned i = (unsigned)(p * (n - 1) + 0.5);
+    return v[i];
+}
 
 static void ap_init(void) {
     if (ap_mode != -2) return;
     const char *e = cfg_get("OOT_PRESENT_INTERVAL");
     ap_mode = !e || !*e || !strcmp(e, "auto") ? -1 : atoi(e) < 0 ? 0 : atoi(e);
-    if (ap_mode == -1) rt_log("nvn: present interval adaptive: 60 fps, or 30 while frames miss 60 (OOT_PRESENT_INTERVAL)");
-    else if (ap_mode > 0) rt_log("nvn: OOT_PRESENT_INTERVAL=%d: presents paced to %d of 60 Hz", ap_mode, ap_mode);
+    if (ap_mode == -1) {
+        perf_gpu_timing_want();   // the prediction at 30 needs the GPU time
+        rt_log("nvn: present interval adaptive: 60 fps, or 30 while %d of %d frames miss 60 (OOT_PRESENT_INTERVAL)",
+               AP_UP_N, AP_WIN);
+    } else if (ap_mode > 0) rt_log("nvn: OOT_PRESENT_INTERVAL=%d: presents paced to %d of 60 Hz", ap_mode, ap_mode);
 }
 
-// At each present, before its slot is taken: the work of the frame that ends here decides the interval.
+static void ap_window_reset(void) {
+    memset(ap_win, 0, sizeof ap_win);
+    ap_pos = ap_n = ap_nbad = 0;
+    ap_sum_cost = ap_sum_work = ap_sum_gpu = 0;
+}
+
+static void ap_window_add(int bad, double cost, double work, double gpu) {
+    if (ap_n == AP_WIN) {
+        ap_nbad -= ap_win[ap_pos].bad;
+        ap_sum_cost -= ap_win[ap_pos].cost, ap_sum_work -= ap_win[ap_pos].work, ap_sum_gpu -= ap_win[ap_pos].gpu;
+    } else ap_n++;
+    ap_win[ap_pos].bad = (uint8_t)bad;
+    ap_win[ap_pos].cost = (float)cost, ap_win[ap_pos].work = (float)work, ap_win[ap_pos].gpu = (float)gpu;
+    ap_nbad += bad;
+    ap_sum_cost += cost, ap_sum_work += work, ap_sum_gpu += gpu;
+    ap_pos = (ap_pos + 1) % AP_WIN;
+}
+
+// At each present, before its slot is taken: the frame that ends here goes into the window, which decides the interval.
 static void ap_present(uint64_t now) {
     ap_init();
     uint64_t wait = (uint64_t)InterlockedExchange64(&ap_wait_ns, 0);
-    if (ap_mode != -1 || !ap_last_present) {
-        ap_last_present = now;
-        return;
-    }
-    uint64_t gap = now - ap_last_present;
+    uint64_t sleep = (uint64_t)InterlockedExchange64(&ap_sleep_ns, 0);
+    uint64_t tot = perf_gpu_busy_total();
+    uint64_t oldest = ap_gpu_tot[ap_gpu_n < AP_GPU_N ? 0 : ap_gpu_pos];   // ap_gpu_n presents ago
+    double gpu = ap_gpu_n ? (double)(tot - oldest) / ap_gpu_n / 1e6 : 0.0;
+    ap_gpu_tot[ap_gpu_pos] = tot;
+    ap_gpu_pos = (ap_gpu_pos + 1) % AP_GPU_N;
+    if (ap_gpu_n < AP_GPU_N) ap_gpu_n++;
+    uint64_t gap = ap_last_present ? now - ap_last_present : 0;
     ap_last_present = now;
-    if (gap > 250000000ull) return;   // loading or a stall: not a frame's work
+    if (!gap || gap > 250000000ull) return;   // the first present, loading or a stall: not a frame's work
+    double cost = (gap > sleep ? (double)(gap - sleep) : 0.0) / 1e6;
     double work = (gap > wait ? (double)(gap - wait) : 0.0) / 1e6;
-    ap_work_ema = ap_work_ema ? 0.9 * ap_work_ema + 0.1 * work : work;
-    if (ap_ticks == 1) {
-        ap_streak = work > AP_UP_MS ? ap_streak + 1 : 0;
-        if (ap_streak >= AP_UP_N) {
-            ap_ticks = 2, ap_streak = 0;
-            rt_log("nvn: frames miss 60 Hz (work %.1f ms on average): pacing at 30 fps", ap_work_ema);
-        }
-    } else {
-        ap_streak = ap_work_ema < AP_DOWN_MS ? ap_streak + 1 : 0;
-        if (ap_streak >= AP_DOWN_N) {
-            ap_ticks = 1, ap_streak = 0;
-            rt_log("nvn: frames fit 60 Hz again (work %.1f ms on average): pacing at 60 fps", ap_work_ema);
+    int miss = cost > AP_MISS_MS, over = work + gpu > AP_FIT_MS;
+    if (rt_trace & RT_TRACE_PERF) {
+        ap_log.c[ap_log.n] = (float)cost, ap_log.p[ap_log.n] = (float)(work + gpu);
+        ap_log.n++, ap_log.miss += miss, ap_log.over += over;
+        ap_log.cost += cost, ap_log.work += work, ap_log.gpu += gpu;
+        if (ap_log.n == AP_LOG_N) {
+            double n = ap_log.n;
+            rt_log("nvn: pacing at %d ticks: last %u frames: %.0f%% cost over %.1f ms (%.1f on average, median %.1f, "
+                   "95th percentile %.1f), %.0f%% predicted over %.1f ms (CPU work %.1f + GPU %.1f on average; "
+                   "median %.1f, 5th percentile %.1f, 95th %.1f)",
+                   ap_mode == -1 ? ap_ticks : ap_mode, ap_log.n, 100.0 * ap_log.miss / n, AP_MISS_MS, ap_log.cost / n,
+                   ap_pct(ap_log.c, ap_log.n, 0.5), ap_pct(ap_log.c, ap_log.n, 0.95), 100.0 * ap_log.over / n,
+                   AP_FIT_MS, ap_log.work / n, ap_log.gpu / n, ap_pct(ap_log.p, ap_log.n, 0.5),
+                   ap_pct(ap_log.p, ap_log.n, 0.05), ap_pct(ap_log.p, ap_log.n, 0.95));
+            ap_log.n = ap_log.miss = ap_log.over = 0;
+            ap_log.cost = ap_log.work = ap_log.gpu = 0;
         }
     }
+    if (ap_mode != -1 || frame_step_realtime()) return;
+    ap_window_add(ap_ticks == 1 ? miss : over, cost, work, gpu);
+    double n = ap_n;
+    if (ap_ticks == 1) {
+        if (ap_nbad < AP_UP_N) return;
+        // Frames miss again soon after a return to 60: the prediction was wrong here, so hold longer before the next.
+        if (ap_switched && now - ap_switched < AP_RETRY_S * AP_S)
+            ap_hold_ns = ap_hold_ns * 2 > AP_HOLD_MAX_S * AP_S ? AP_HOLD_MAX_S * AP_S : ap_hold_ns * 2;
+        else ap_hold_ns = AP_HOLD_S * AP_S;
+        rt_log("nvn: frames miss 60 Hz (%d of the last %d cost over %.1f ms, %.1f ms on average; GPU %.1f ms): "
+               "pacing at 30 fps for at least %llu s", ap_nbad, ap_n, AP_MISS_MS, ap_sum_cost / n, ap_sum_gpu / n,
+               (unsigned long long)(ap_hold_ns / AP_S));
+        ap_ticks = 2;
+    } else {
+        if (ap_n < AP_WIN || ap_nbad > AP_DOWN_N || now - ap_switched < ap_hold_ns) return;
+        rt_log("nvn: frames fit 60 Hz again (%d of the last %d predicted over %.1f ms; CPU work %.1f + GPU %.1f ms on "
+               "average): pacing at 60 fps", ap_nbad, ap_n, AP_FIT_MS, ap_sum_work / n, ap_sum_gpu / n);
+        ap_ticks = 1;
+    }
+    ap_switched = now;
+    ap_window_reset();
 }
 
 static uint64_t present_period(const win_t *o) {
@@ -941,6 +1035,7 @@ NVN_API(nvnWindowAcquireTexture) {
         uint64_t p0 = perf_begin();
         sleep_until(at);
         perf_end(PERF_PACE, p0);
+        InterlockedAdd64(&ap_sleep_ns, (LONG64)(kern_now_ns() - w0));   // the pacer's part of the wait
     }
     // The image is also free only once the GPU finished the frame it was last presented with: on the Switch the
     // display's release of the image implies that, and games count on it to keep their CPU at most a window's worth

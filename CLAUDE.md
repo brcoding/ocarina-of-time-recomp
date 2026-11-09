@@ -62,9 +62,10 @@ reads 0 (`docs/level.md`). The game embeds Lua, whose errors longjmp: `runtime/s
 Long runs need memory headroom: the game commits about 21 GB on the level. The black frames while walking (NaN from Link's
 material pass spread by bloom and the upscaler) come from an uneven frame rate between 30 and 60, not from a CPU/GPU
 race: the pacer now holds 30 fps while frames miss 60 Hz (`nvn_api_obj.c`, adaptive interval; `OOT_PRESENT_INTERVAL=0`
-off, `=<n>` fixed), `docs/level.md` Status, 2026-11-08 night. Lesson from it: anything that slows the frame (dumps,
-`--shot`, screenshots every frame, `OOT_GPU_AHEAD=0`) hides frame-rate-dependent glitches; use `OOT_DUMP_TRACE` to
-look at them.
+off, `=<n>` fixed), `docs/level.md` Status, 2026-11-08 night; since 2026-11-09 it decides from a window of 120 frames
+and predicts the cost at 60 from CPU work plus GPU time (`OOT_TRACE=perf` logs both). Lesson from it: anything that
+slows the frame (dumps, `--shot`, screenshots every frame, `OOT_GPU_AHEAD=0`) hides frame-rate-dependent glitches; use
+`OOT_DUMP_TRACE` to look at them.
 `python3.14 tools/shader_census.py --version v131072 --lower` lowers the whole corpus (14,363 programs) and lists
 the refusals in `build/v131072/shaders/lowered.txt`.
 
