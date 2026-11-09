@@ -610,7 +610,12 @@ def run_game(seconds: int = 60, shot: str | None = None, env: dict | None = None
                 shot_path.unlink(missing_ok=True)
             exe_arg = str(EXE) if os.name == "nt" else for_exe(EXE)
             marker = for_exe(inst.profile)
-            args = [exe_arg, "--profile", marker, "--seconds", str(seconds)]
+            args = [exe_arg, "--profile", marker]
+            # A mode of its own (--probe-tensor, --selftest, ...) after "--" excludes --seconds: oot.exe's usage
+            # takes one mode, and --seconds is the play mode. The timeout still follows --seconds.
+            if not any(a.startswith("--probe") or a in ("--selftest", "--boot", "--prepare-shaders", "--warm-shaders")
+                       for a in extra or []):
+                args += ["--seconds", str(seconds)]
             if shot_path:
                 args += ["--shot", for_exe(shot_path)]
             args += extra or []
