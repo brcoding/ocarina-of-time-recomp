@@ -72,8 +72,16 @@ the refusals in `build/v131072/shaders/lowered.txt`.
 
 - Run the game with `python3 tools/run.py` (`--seconds`, `--shot`, `--press-a`, `--env OOT_X=V`, `--fresh-cache`,
   `--dump`, `--expect REGEX`), never by hand: it names every `OOT_*` variable in WSLENV, retries a crash in the first 25 s,
-  numbers the log (`build/logs/run-<n>.log`), kills `oot.exe` and `oot_xlate.exe` afterwards and refuses to overlap
-  runs. `--expect` checks the log for a line proving a diagnostic switch applied.
+  numbers the log (`build/logs/run-<n>.log`) and kills its own `oot.exe` and that game's `oot_xlate.exe` afterwards.
+  `--expect` checks the log for a line proving a diagnostic switch applied. Several runs may go at once, from several
+  sessions or worktrees: each is an instance (`--list` shows the live ones) with its own throwaway copy of
+  `build/profile` (`--profile DIR` keeps saves across runs) and the real pad and keyboard off (`--live-input`). VRAM is
+  shared, so runs are admitted against a budget: a game holds about 1.4 GB at the title and 12 GB at the level of the
+  card's 14 GB Vulkan budget, so one level run (`--replay`) goes with title runs but never with another level run
+  (`--vram GB`, `OOT_VRAM_GB`; a game run.py did not start counts 12). A frame rate or GPU time needs `--alone`, which
+  waits until no other game runs and holds new runs back meanwhile. Instances of one build dir share its shader and pipeline caches safely (file locks,
+  merged pipeline-cache saves), and `tools/build_game.py` relinks a build dir while a game from it runs. A worktree's
+  `tools/run.py` from before 2026-11-09 still kills every `oot.exe` after its runs: update it or run from the main checkout.
 - After a change to the lowering, the translator or anything a shader computes, follow the project skill
   `verify-shader-change` (`.claude/skills/`): probes, one kernel both ways, scored screenshots. A frame rate counts
   only next to a screenshot that `tools/shot_diff.py` scores as a picture.

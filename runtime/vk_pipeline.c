@@ -172,9 +172,23 @@ static void cache_path_init(void) {
     snprintf(P.cache_path, sizeof P.cache_path, "%s\\pipeline-cache.bin", exe);
 }
 
-// Cache data whose header names another device or driver is dropped before Vulkan sees it.
-static void cache_load(VkCtx *c) {
-    cache_path_init();
+// Other game instances of this build dir save to the same file (tools/run.py runs several at once). A save merges in
+// what the file holds when it changed since this process last read or wrote it, and after one such merge at every save
+// (the file then holds pipelines P.cache lacks), so the last instance to save does not drop the others' pipelines: a
+// cold build of the upscaler's kernels costs minutes on AMD. The read-merge-write runs under <file>.lock.
+static FILETIME cache_stamp;   // the file's last write time when this process last read or wrote it
+static int cache_foreign;      // the file holds another instance's pipelines that P.cache lacks
+
+static int cache_file_time(FILETIME *t) {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExA(P.cache_path, GetFileExInfoStandard, &a)) return 0;
+    *t = a.ftLastWriteTime;
+    return 1;
+}
+
+// The cache file's data (malloc'd) when a device and driver like ours wrote it; NULL otherwise. Data whose header names
+// another device or driver is dropped before Vulkan sees it.
+static void *cache_file_read(VkCtx *c, size_t *out) {
     void *data = NULL;
     size_t size = 0;
     FILE *f = P.cache_path[0] ? fopen(P.cache_path, "rb") : NULL;
@@ -194,6 +208,16 @@ static void cache_load(VkCtx *c) {
             size = 0;
         }
     }
+    if (!size) free(data), data = NULL;
+    *out = size;
+    return data;
+}
+
+static void cache_load(VkCtx *c) {
+    cache_path_init();
+    size_t size = 0;
+    void *data = cache_file_read(c, &size);
+    if (P.cache_path[0]) cache_file_time(&cache_stamp);
     VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = size,
                                     .pInitialData = size ? data : NULL};
     if (vkCreatePipelineCache(c->device, &ci, NULL, &P.cache) != VK_SUCCESS) {
@@ -2294,6 +2318,26 @@ static void keys_note(const VkPipeState *s) {
     K.pend[K.pend_n++] = r;
 }
 
+// 1 when K.path starts with our header; with cut, a torn last record (a writer died mid-append) is cut off first.
+// Caller holds the file's plat_file_lock.
+static int keys_header_ok(int cut) {
+    FILE *f = fopen(K.path, "rb");
+    if (!f) return 0;
+    KeysHeader h;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    int ok = len >= (long)sizeof h && fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "TOTKPKEY", 8) &&
+             h.version == KEYS_VERSION && h.rec_size == sizeof(KeyRec);
+    fclose(f);
+    long whole = ok ? (long)sizeof h + (len - (long)sizeof h) / (long)sizeof(KeyRec) * (long)sizeof(KeyRec) : len;
+    if (ok && cut && whole != len) {
+        if (plat_file_truncate(K.path, (uint64_t)whole)) rt_log("vk_pipeline: %s had a torn tail; cut to %ld bytes", K.path, whole);
+        else ok = 0;   // rewritten instead
+    }
+    return ok;
+}
+
 // Appends the pending records (present thread or exit; never the render thread).
 static void keys_flush(void) {
     if (!K.path[0]) return;
@@ -2304,6 +2348,11 @@ static void keys_flush(void) {
     K.pend = NULL, K.pend_n = K.pend_cap = 0;
     ReleaseSRWLockExclusive(&P.lock);
     if (n) {
+        // Other game instances of this build dir append to the same file: under its cross-process lock, the header is
+        // judged from the file as it is now (another instance may have rewritten it since keys_open), and a tail an
+        // instance left torn when it died is cut before the append.
+        PlatFileLock *l = plat_file_lock(K.path);
+        K.header_ok = keys_header_ok(1);
         FILE *f = fopen(K.path, K.header_ok ? "ab" : "wb");
         int ok = f != NULL;
         if (ok && !K.header_ok) {
@@ -2313,12 +2362,15 @@ static void keys_flush(void) {
         if (ok) ok = fwrite(r, sizeof *r, n, f) == n;
         if (ok) ok = !fflush(f) && !_commit(_fileno(f));   // appended records on the disk before the next append
         if (f) ok = !fclose(f) && ok;
+        plat_file_unlock(l);
         if (ok) K.header_ok = 1;
         else rt_log("vk_pipeline: cannot write %s", K.path);
     }
     free(r);
     ReleaseSRWLockExclusive(&K.io);
 }
+
+static void keys_read(void);
 
 // Reads the key file into K.file and its record hashes into the set. Caller holds P.lock (ensure_init).
 static void keys_open(void) {
@@ -2328,6 +2380,15 @@ static void keys_open(void) {
     if (fslash > slash) slash = fslash;
     snprintf(slash ? slash + 1 : K.path, sizeof K.path - (size_t)(slash ? slash + 1 - K.path : 0), "pipeline-keys.bin");
     gfx_shader_record_at(K.path);   // shader-answers.bin next to it (gfx_shader.c)
+    // Under the file's cross-process lock, as keys_flush appends: another instance's append is never read half-written.
+    PlatFileLock *l = plat_file_lock(K.path);
+    keys_read();
+    plat_file_unlock(l);
+}
+
+// keys_open's read, under the file's lock: a torn tail (a writer died mid-append) is cut, not rewritten, since other
+// instances may append after it.
+static void keys_read(void) {
     FILE *f = fopen(K.path, "rb");
     if (!f) return;
     KeysHeader h;
@@ -2341,13 +2402,12 @@ static void keys_open(void) {
         if (n && (K.file = malloc(n * sizeof(KeyRec))) && fread(K.file, sizeof(KeyRec), n, f) == n) K.file_n = n;
         else free(K.file), K.file = NULL;
         for (size_t i = 0; i < K.file_n; i++) seen_add(rec_hash((const KeyRec *)K.file + i));
-        if (len != (long)(sizeof h + n * sizeof(KeyRec)))   // a torn append: rewrite the file from what was read
-            K.header_ok = 0;
-    } else {
+    } else if (len > 0) {
         rt_log("vk_pipeline: %s has another format or version; it is rewritten", K.path);
     }
     fclose(f);
-    if (!K.header_ok && K.file_n) {   // keep the whole records of a torn file
+    if (K.header_ok) K.header_ok = keys_header_ok(1);   // cuts a torn tail
+    if (!K.header_ok && K.file_n) {   // could not cut it: keep the whole records in the rewrite
         KeyRec *t = malloc(K.file_n * sizeof *t);
         if (t) memcpy(t, K.file, K.file_n * sizeof *t), K.pend = t, K.pend_n = K.pend_cap = (uint32_t)K.file_n;
     }
@@ -3643,13 +3703,35 @@ void vk_pipeline_save(void) {
         ReleaseSRWLockExclusive(&save_lock);
         return;
     }
+    char lock_path[sizeof P.cache_path + 8];
+    snprintf(lock_path, sizeof lock_path, "%s.lock", P.cache_path);
+    PlatFileLock *l = plat_file_lock(lock_path);   // another instance's read-merge-write (cache_stamp, above)
+    FILETIME now;
+    VkPipelineCache src = P.cache, merged = VK_NULL_HANDLE;
+    if (cache_foreign || (cache_file_time(&now) && CompareFileTime(&now, &cache_stamp))) {
+        size_t dn = 0;
+        void *disk = cache_file_read(vk_ctx(), &dn);
+        VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = dn,
+                                        .pInitialData = disk};
+        // Merged into a cache of the file's data, not into P.cache: a merge's destination needs external
+        // synchronisation, and pipeline builds use P.cache meanwhile.
+        if (disk && vkCreatePipelineCache(P.device, &ci, NULL, &merged) == VK_SUCCESS &&
+            vkMergePipelineCaches(P.device, merged, 1, &P.cache) == VK_SUCCESS) {
+            if (!cache_foreign) rt_log("vk_pipeline: another instance saved %s; merging it into every save", P.cache_path);
+            src = merged, cache_foreign = 1;
+        }
+        free(disk);
+    }
     size_t size = 0;
     void *data = NULL;
-    if (vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
-        vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS) {
-        if (!plat_file_write_atomic(P.cache_path, data, size)) rt_log("vk_pipeline: cannot write %s", P.cache_path);
+    if (vkGetPipelineCacheData(P.device, src, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
+        vkGetPipelineCacheData(P.device, src, &size, data) == VK_SUCCESS) {
+        if (plat_file_write_atomic(P.cache_path, data, size)) cache_file_time(&cache_stamp);
+        else rt_log("vk_pipeline: cannot write %s", P.cache_path);
     }
     free(data);
+    if (merged) vkDestroyPipelineCache(P.device, merged, NULL);
+    plat_file_unlock(l);
     ReleaseSRWLockExclusive(&save_lock);
 }
 

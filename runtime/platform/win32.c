@@ -217,6 +217,31 @@ int plat_append_write(PlatAppend *f, const void *data, size_t n) {
     return WriteFile((HANDLE)f, data, (DWORD)n, &put, &o) && put == n;
 }
 
+// LockFileEx's ranges bind every handle of other processes, but only for I/O inside the range: one byte at 2^62 is never
+// data. FILE_SHARE_DELETE lets a holder remove the file (gfx_shader.c rec_read drops one of another format).
+static OVERLAPPED lock_range(void) { return (OVERLAPPED){.Offset = 0, .OffsetHigh = 0x40000000}; }
+
+PlatFileLock *plat_file_lock(const char *path) {
+    wchar_t w[WPATH];
+    if (!widen(path, w, WPATH)) return NULL;
+    HANDLE h = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    OVERLAPPED o = lock_range();
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &o)) {
+        CloseHandle(h);
+        return NULL;
+    }
+    return (PlatFileLock *)h;
+}
+
+void plat_file_unlock(PlatFileLock *l) {
+    if (!l) return;
+    OVERLAPPED o = lock_range();
+    UnlockFileEx((HANDLE)l, 0, 1, 0, &o);
+    CloseHandle((HANDLE)l);
+}
+
 int plat_file_replace(const char *from, const char *to) {
     wchar_t a[WPATH], b[WPATH];
     if (!widen(from, a, WPATH) || !widen(to, b, WPATH)) return 0;
@@ -256,7 +281,9 @@ void plat_file_delete(const char *path) {
 int plat_file_truncate(const char *path, uint64_t size) {
     wchar_t w[WPATH];
     if (!widen(path, w, WPATH)) return 0;
-    HANDLE h = CreateFileW(w, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    // Shared: its only caller (gfx_shader.c) truncates under plat_file_lock, whose handle stays open on the same file.
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0,
+                           NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     LARGE_INTEGER at = {.QuadPart = (LONGLONG)size};
     int ok = SetFilePointerEx(h, at, NULL, FILE_BEGIN) && SetEndOfFile(h);

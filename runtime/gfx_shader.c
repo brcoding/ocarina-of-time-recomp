@@ -2106,6 +2106,9 @@ void gfx_shader_record_at(const char *keys_path) {
     snprintf(RC.prg_path, sizeof RC.prg_path, "%.*sshader-programs.bin", dir, keys_path);
     uint8_t *b;
     size_t n;
+    // Other game instances of this build dir append to the same files: read and cut a torn tail under their file locks
+    // (rec_append), so a tail being written is neither read nor cut. Order ans, prg, as everywhere.
+    PlatFileLock *la = plat_file_lock(RC.ans_path), *lp = plat_file_lock(RC.prg_path);
     if (rec_read(RC.ans_path, "TOTKSANS", ANS_VERSION, ANS_REC, &b, &n)) {
         for (size_t o = 0; o + ANS_REC <= n; o += ANS_REC) set_add(&RC.pairs, hash8(b + o + 36));
         if (n % ANS_REC) truncate_to(RC.ans_path, sizeof(RecHeader) + n / ANS_REC * ANS_REC);
@@ -2116,6 +2119,7 @@ void gfx_shader_record_at(const char *keys_path) {
         if (whole != n) truncate_to(RC.prg_path, sizeof(RecHeader) + whole);
     }
     free(b);
+    plat_file_unlock(lp), plat_file_unlock(la);
     rt_log("gfx_shader: recording answers met in play to %s (%u records, %u programs recorded before)", RC.ans_path,
            RC.pairs.n, RC.progs.n);
     InterlockedExchange(&RC.on, 1);
@@ -2144,9 +2148,15 @@ static void ans_note(const Req *r, int stage, const uint8_t *control, const uint
     ReleaseSRWLockExclusive(&RC.lock);
 }
 
+// Under the file's cross-process lock: the CRT's append mode seeks to the end and then writes, so two game instances
+// of one build dir could write at the same offset, and both could find the file empty and write a header.
 static int rec_append(const char *path, const char *magic, uint32_t version, uint32_t rec_size, const Bytes *b) {
+    PlatFileLock *l = plat_file_lock(path);
     FILE *f = fopen(path, "ab");
-    if (!f) return 0;
+    if (!f) {
+        plat_file_unlock(l);
+        return 0;
+    }
     fseek(f, 0, SEEK_END);
     int ok = 1;
     if (ftell(f) == 0) {
@@ -2155,7 +2165,9 @@ static int rec_append(const char *path, const char *magic, uint32_t version, uin
         ok = fwrite(&h, sizeof h, 1, f) == 1;
     }
     ok = ok && fwrite(b->p, 1, b->n, f) == b->n;
-    return !fclose(f) && ok;
+    ok = !fclose(f) && ok;
+    plat_file_unlock(l);
+    return ok;
 }
 
 static SRWLOCK rec_io = SRWLOCK_INIT;   // the record files: appends in order, no read during an append
@@ -2343,8 +2355,10 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out) {
              RC.ans_path);
     uint8_t *ab = NULL, *pb = NULL;
     size_t an = 0, pn = 0;
-    AcquireSRWLockExclusive(&rec_io);                      // no append meanwhile
+    AcquireSRWLockExclusive(&rec_io);                      // no append meanwhile, from this process or another
+    PlatFileLock *l = plat_file_lock(RC.ans_path);
     rec_read(RC.ans_path, "TOTKSANS", ANS_VERSION, ANS_REC, &ab, &an);
+    plat_file_unlock(l);
     ReleaseSRWLockExclusive(&rec_io);
     rec_read(prp, "TOTKSPRP", PRP_VERSION, PRP_REC, &pb, &pn);
     size_t na = an / ANS_REC, np = pn / PRP_REC, n = 0;

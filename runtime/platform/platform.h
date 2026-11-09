@@ -78,6 +78,13 @@ int plat_file_set_readonly(const char *path, int on);     // sets or clears the 
 typedef struct PlatAppend PlatAppend;
 PlatAppend *plat_append_open(const char *path);           // creates or truncates path; NULL on failure
 int plat_append_write(PlatAppend *f, const void *data, size_t n);   // 1 when all n bytes landed
+// A lock shared by every process that opens path this way, for files several game instances read and append to (the
+// record files next to oot.exe): blocks until held, creates path when missing. It sits on a byte range far past any
+// data, so it keeps other holders out without blocking anyone's reads or writes. The OS drops it if the holder dies.
+// NULL when path cannot be opened (the caller goes on unlocked).
+typedef struct PlatFileLock PlatFileLock;
+PlatFileLock *plat_file_lock(const char *path);
+void plat_file_unlock(PlatFileLock *l);                   // NULL is fine
 // Calls cb(name, ctx) for each file in dir whose name ends in ext (".in"); name has no directory part. cb returns 0 to
 // stop. Returns 0 when dir cannot be listed.
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx);

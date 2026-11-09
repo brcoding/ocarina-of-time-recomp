@@ -530,6 +530,30 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 CREATE_SUSPENDED = 0x4
 
 
+def move_running_exe(exe: Path) -> None:
+    """Windows cannot overwrite a running program but can rename it: an oot.exe a game instance runs (tools/run.py runs
+    several, from other sessions too) moves to oot.exe.<time>.old, so the link writes a new one and the running game
+    goes on with the old. Old copies whose game has ended are deleted."""
+    for old in exe.parent.glob(exe.name + '.*.old'):
+        try:
+            old.unlink()
+        except OSError:
+            pass   # still running
+    if not exe.exists():
+        return
+    try:
+        with open(exe, 'r+b'):
+            return   # not running
+    except PermissionError:
+        pass
+    aside = exe.with_name(f'{exe.name}.{int(time.time())}.old')
+    try:
+        exe.rename(aside)
+        print(f'build_game: {below_root(exe)} is running; moved it to {aside.name} for the link', flush=True)
+    except OSError as e:
+        print(f'build_game: {below_root(exe)} is running and cannot be moved ({e}); the link will fail', file=sys.stderr)
+
+
 def run_measured(cmd, env):
     """Run cmd in its own job object. Returns (exit code, seconds, peak bytes of one process, peak bytes of all)."""
     k32 = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -732,6 +756,8 @@ def main():
         return
     if args.make_runtime_lib:
         exe.unlink(missing_ok=True)   # ar rcs would keep members of deleted sources
+    else:
+        move_running_exe(exe)
     code, dt, peak_one, _ = run_measured(base + [flag_path(exe)], env)
     print(f'link: {dt:.1f} s, peak {mib(peak_one)}')
     if code:
@@ -742,7 +768,14 @@ def main():
         print(f'{below_root(exe)}: {mib(exe.stat().st_size)}')
         return
     for dll in dlls:   # dynamic SDL3 (zlib) and its libiconv (LGPL, unmodified DLL), found next to oot.exe
-        shutil.copy2(dll, exe.parent / dll.name)
+        dest = exe.parent / dll.name
+        src_st = dll.stat()
+        if dest.exists() and dest.stat().st_size == src_st.st_size and dest.stat().st_mtime == src_st.st_mtime:
+            continue   # unchanged; a running game instance keeps it open, and Windows refuses to overwrite it
+        try:
+            shutil.copy2(dll, dest)
+        except PermissionError:
+            print(f'build_game: {below_root(dest)} is in use by a running game; not updated', file=sys.stderr)
     sections, image = pe_sections(exe)
     print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}, '
           f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in sections.items() if k.startswith('.') and v))
