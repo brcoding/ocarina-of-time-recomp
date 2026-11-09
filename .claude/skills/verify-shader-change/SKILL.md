@@ -20,6 +20,7 @@ order and stop at the first that fails.
     build/v131072/oot.exe --probe-tensor     # LDSM, LDSM.trans, HMMA against a CPU reference; HMMA pairs with
                                              # an accumulator chain and swapped B halves (the 16x16x16 plan), and
                                              # how the device rounds (once per HMMA, or after every step)
+    build/v131072/oot.exe --probe-shf        # every funnel-shift form, amounts 0-219, against a CPU reference
     build/v131072/oot.exe --probe-coopmat    # the device's cooperative-matrix shapes
     build/v131072/oot.exe --probe-vkmem      # texture layout (block-linear, GOB order), uploads
 

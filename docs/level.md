@@ -130,7 +130,16 @@ After each change that alters what a shader computes: the `verify-shader-change`
 - ISETP.EX restores its saved predicate under the instruction's own guard; Fritchii unconditionally (no program of
   the cache is affected).
 - Ryujinx's funnel shift `(A >> B) | (C << (32 - B))` shifts by 32 when B is 0, which SPIR-V leaves undefined; NVIDIA
-  gives the right answer, other GPUs may not (#9 is an AMD card).
+  gives the right answer, other GPUs may not (#9 is an AMD card). Answered 2026-11-09: `oot.exe --probe-shf` runs every
+  form lower_shf passes on (SHF.R and SHF.L.HI, U32 and U64, wrap and clamp) with amounts 0-219 against a CPU
+  reference. The RX 9070 XT returns A | C for every amount that wraps to 0 (14 of 768 results), and Ryujinx gives 0 for
+  the clamped 32-bit forms at amounts of 32 or more, where the hardware clamps the amount and keeps the other word (128
+  more, on any GPU). The level reaches the first: the programs it loads (`shader-programs.bin` of a level run) hold 20
+  mesh and task programs with 726 true funnel shifts, all SHF.R.U64 without .W, 610 of them by a register (the census
+  corpus has only 9 of the level's mesh programs and none of these). Ryzen1998's fork found the same from the other
+  end (c7b8e4b, read for comparison, no code taken: meshlet indices at bit offsets that are multiples of 32 picked
+  unwritten vertices, stray triangles) and fixed it in the lowering. Translator patch 0029 fixes both cases at their
+  source, Ryujinx's EmitShf; the probe passes with it.
 - RED.ADD.F32 offsets are cut to 20 bits silently (Fritchii range-checks them).
 - `tools/xlate/wip/0025` (#12, numbered 0024 there before main took 0024) was written for the branch's page-table layout, which the merge left out; it does not
   match P1's table at support-buffer byte 1408.

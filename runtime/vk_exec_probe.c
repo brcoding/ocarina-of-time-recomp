@@ -1258,6 +1258,140 @@ int probe_tensor(void) {
     return 0;
 }
 
+// ---- funnel-shift part (oot.exe --probe-shf): every SHF form sm86_lower.c lower_shf passes to the translator as a
+// true funnel shift (SHF.R low word and SHF.L high word, U32 and U64, wrap and clamp) with the shift amount in a
+// register, run on the host GPU against a CPU reference. Ryujinx's InstEmitShift.cs EmitShf built SHF.R as
+// (A >> B) | (C << (32 - B)), which shifts C by 32 when B is 0: SPIR-V leaves that undefined, and the RX 9070 XT
+// returned A | C (14 of the 768 results); it also gave 0 for the clamped 32-bit forms at amounts of 32 or more (128
+// more, on any GPU). Translator patch 0029 fixes both (docs/level.md, open questions). One 32-lane workgroup: lane L
+// loads A, C and three shift amounts (L, 32 + L, 64 + 3L) from storage buffer slot 0 and stores the 8 forms by 3
+// amounts at +1024 + 128 (3 form + set) + 4L.
+// Encodings as sm86_lower.c decodes them: SHF register form 0x219, A at 24, B at 32, C at 64, type at 73 (1 U64,
+// 3 U32), wrap 75, right 76, high word 80.
+
+#define SHF_BUF 4096
+
+// The PTX shf semantics: the 64-bit value C:A, the amount wrapped to (or clamped at) 32 or 64; SHF.R keeps the low
+// word of the right shift, SHF.L.HI the high word of the left shift.
+static uint32_t shf_ref(uint32_t a, uint32_t c, uint32_t s, int u64, int wrap, int right) {
+    uint64_t v = (uint64_t)c << 32 | a;
+    uint32_t max = u64 ? 64 : 32, n = wrap ? s & (max - 1) : s < max ? s : max;
+    if (n >= 64) return 0;
+    return right ? (uint32_t)(v >> n) : (uint32_t)((v << n) >> 32);
+}
+
+static int probe_shf_run(const GfxBackend *b, uint8_t *guest, int *n_bad, int *n_zero_bad) {
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest + 0x400000, .size = 0x100000,
+                   .game_mem = guest + 0x400000};
+    CHECK(b->pool_init(&pool), "pool_init of a CPU-visible pool for the funnel-shift part");
+    uint8_t *buf = pool.mem;
+    memset(buf, 0, SHF_BUF);
+    uint32_t *A = (uint32_t *)buf, *C = (uint32_t *)(buf + 128), *S = (uint32_t *)(buf + 256);
+    for (uint32_t L = 0; L < 32; L++) {
+        A[L] = 0x89abcdefu ^ (L * 0x01030507u);
+        C[L] = 0x13579bdfu + L * 0x11111111u;
+        S[L] = L, S[32 + L] = 32 + L, S[64 + L] = 64 + 3 * L;
+    }
+    static const struct { int u64, wrap, right; const char *name; } forms[8] = {
+        {1, 1, 1, "SHF.R.W.U64"}, {1, 0, 1, "SHF.R.U64"}, {0, 1, 1, "SHF.R.W.U32"}, {0, 0, 1, "SHF.R.U32"},
+        {1, 1, 0, "SHF.L.W.U64.HI"}, {1, 0, 0, "SHF.L.U64.HI"}, {0, 1, 0, "SHF.L.W.U32.HI"}, {0, 0, 0, "SHF.L.U32.HI"},
+    };
+    // Registers: R0 lane, R1 = 4L, R2 A, R3 C, R4-6 the amounts, R8-31 the results. UR4:5 = the buffer's address.
+    static _Alignas(256) TnInsn code[64];
+    memset(code, 0, sizeof code);
+    TnInsn *p = code;
+    tn_emit(&p, 0x0919 | 0 << 16, 0, 0);                                       // S2R R0, SR_LANEID
+    tn_emit(&p, 0x0824 | 1 << 16 | 0 << 24, 4, 0x078e00ffu);                   // IMAD R1, R0, 4, RZ
+    tn_emit(&p, 0x0ab9 | 4 << 16 | 0xff << 24, 0x10 << 6, 5 << 9);             // ULDC.64 UR4, c[0][0x10]
+    for (uint32_t i = 0; i < 5; i++)                                           // LDG.E R2+i, [R1 + UR4 + 128 i]
+        tn_emit(&p, 0x0981 | (2 + i) << 16 | 1 << 24, 4 | (128 * i) << 8, 0x081e8100u | 4 << 9);
+    for (uint32_t f = 0; f < 8; f++)
+        for (uint32_t s = 0; s < 3; s++) {
+            uint32_t rd = 8 + 3 * f + s, type = forms[f].u64 ? 1 : 3;
+            tn_emit(&p, 0x0219 | rd << 16 | 2 << 24, 4 + s,                    // SHF Rd, R2, R4+s, R3
+                    3 | type << 9 | (uint32_t)forms[f].wrap << 11 | (uint32_t)forms[f].right << 12 |
+                        (uint32_t)!forms[f].right << 16);
+        }
+    for (uint32_t k = 0; k < 24; k++)                                          // STG.E [R1 + UR4 + 1024 + 128 k], R8+k
+        tn_emit(&p, 0x0986 | 1 << 24, (8 + k) | (1024 + 128 * k) << 8, 0x0810a100u | 4 | 4 << 9);
+    tn_emit(&p, 0x094d, 0, 0x03800000u);                                       // EXIT
+    uint32_t code_end = (uint32_t)((p - code) * 16), code_size = 1024;
+    static uint8_t ctl[0x100];
+    memset(ctl, 0, sizeof ctl);
+    const uint32_t magic = SM86_CONTROL_MAGIC, ctl_size = SM86_CONTROL_MIN, local[3] = {32, 1, 1};
+    memcpy(ctl, &magic, 4), memcpy(ctl + 0x30, &ctl_size, 4), memcpy(ctl + 0xd4, &ctl_size, 4);
+    memcpy(ctl + 0x38, &code_end, 4), memcpy(ctl + 0x40, &code_size, 4), memcpy(ctl + 0x44, &code_size, 4);
+    ctl[0x56] = 5, ctl[0xb2] = 1;                                              // compute; one storage buffer slot
+    memcpy(ctl + 0x58, local, 12);
+    static prog_t prog;
+    memset(&prog, 0, sizeof prog);
+    prog.magic = NVN_PROG_MAGIC, prog.serial = 0x7300, prog.nstage = 1;
+    prog.sd[0].data = (uint64_t)(uintptr_t)code, prog.sd[0].control = ctl;
+
+    static _Alignas(8) uint8_t stream[1024];
+    uint8_t *q = stream;
+    q = put(q, OP_BEGIN, NULL, 0);
+    const p_bind_program bp = {&prog, 1 << 5};
+    q = put(q, OP_BIND_PROGRAM, &bp, sizeof bp);
+    const p_bind_buf sb = {5, 0, (uint64_t)(uintptr_t)buf, SHF_BUF};
+    q = put(q, OP_BIND_SSBO, &sb, sizeof sb);
+    const p_dispatch dp = {1, 1, 1, 0};
+    q = put(q, OP_DISPATCH, &dp, sizeof dp);
+    const p_barrier bar = {0, 0};
+    q = put(q, OP_BARRIER, &bar, sizeof bar);
+    q = put(q, OP_END, NULL, 0);
+    uint64_t handle = (uint64_t)(uintptr_t)stream;
+    uint64_t fv = b->submit(&handle, 1);
+    CHECK(b->fence_wait(fv, 20000000000ull), "fence_wait of the funnel-shift dispatch timed out");
+
+    int bad = 0, zero_bad = 0;
+    static const char *const set_name[3] = {"0-31", "32-63", "64+"};
+    for (uint32_t f = 0; f < 8; f++)
+        for (uint32_t s = 0; s < 3; s++) {
+            const uint32_t *out = (const uint32_t *)(buf + 1024 + 128 * (3 * f + s));
+            int wrong = 0, shown = 0;
+            for (uint32_t L = 0; L < 32; L++) {
+                uint32_t amt = S[32 * s + L];
+                uint32_t want = shf_ref(A[L], C[L], amt, forms[f].u64, forms[f].wrap, forms[f].right);
+                if (out[L] == want) continue;
+                wrong++;
+                uint32_t eff = forms[f].wrap ? amt & (forms[f].u64 ? 63u : 31u) : amt;
+                if (eff == 0) zero_bad++;
+                if (shown++ < 3)
+                    printf("probe-shf: %s amount %u (lane %u): %08x, expected %08x (A %08x, C %08x, A|C %08x)\n",
+                           forms[f].name, amt, L, out[L], want, A[L], C[L], A[L] | C[L]);
+            }
+            printf("probe-shf: %-15s amounts %-5s: %2d of 32 lanes wrong\n", forms[f].name, set_name[s], wrong);
+            bad += wrong;
+        }
+    b->pool_fini(&pool);
+    *n_bad = bad, *n_zero_bad = zero_bad;
+    return 0;
+}
+
+int probe_shf(void) {
+    main_tid = GetCurrentThreadId();
+    const GfxBackend *b = &gfx_vulkan_backend;
+    uint64_t heap = 0;
+    CHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");
+    uint8_t *guest = (uint8_t *)(uintptr_t)heap;
+    int n_bad = -1, n_zero = 0;
+    int bad = probe_shf_run(b, guest, &n_bad, &n_zero);
+    b->finish();
+    vk_pipeline_shutdown();
+    vk_exec_draw_shutdown();
+    vk_exec_xfer_shutdown();
+    vk_backend_shutdown();
+    long errors = vk_validation_errors_total();
+    if (bad || n_bad || errors) {
+        printf("probe-shf: FAILED (%d of 768 results wrong, %d of them with an amount of 0; %ld validation errors)\n",
+               n_bad, n_zero, errors);
+        return 1;
+    }
+    printf("probe-shf: passed (8 funnel-shift forms by amounts 0-219 exact, 0 validation errors)\n");
+    return 0;
+}
+
 // ---- kernel part (oot.exe --probe-cs <dir>): one NVN2 compute kernel of the game dispatched in isolation with
 // stand-in resources, to bisect a device loss or a wrong result outside the game (2026-11-06: the cinematic's first
 // neural-network layer faulted the GPU). <dir> holds the control section (ctl), the code block (code) and bindings.txt:
