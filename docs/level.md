@@ -212,3 +212,26 @@ After each change that alters what a shader computes: the `verify-shader-change`
     storage slot 0 at negative offsets (`[UR4 - 4]`, `[UR4 - 16]`, UR4 = c0 0x770), which the foliage programs that
     draw right do not. Skipped by default (`MESH_SKIP_DEFAULT`) until that is fixed: no tangle, no grass. Clearing the
     whole mesh stage buffer at the start (tried as a patch 0027) did not change it.
+- 2026-11-08, night (RTX 2080): the black frames while walking (whole frames black but the HUD, 4 of 17 shots of the
+  recorded walk `build/logs/walk.txt` at 44-60 s, none with `OOT_GPU_AHEAD=0`). Cause and fix:
+  - `OOT_DUMP_TRACE=<lo>-<hi>` (new, `vk_dump.c`): the centre and corner of every large target, read back at its
+    fence with no wait, so the CPU and GPU keep their overlap (a dump, a screenshot and `OOT_GPU_AHEAD=0` all slow the
+    frame down, and none of them ever showed a black frame). On a black frame the first bad value is a NaN in Link's
+    own colour target (`0x1505bd1000`, his material pass, fs `0eabd88d`); the passes after it (his downsample, the
+    scene, bloom, `1cb856c3`, the upscaler `eb41de8d`) spread it over the whole picture and the tone map makes it
+    black. `OOT_DUMP_TRACE_DRAWS=a<addr>` samples after every draw of that target: the NaN comes from Link's draw 0,
+    every other frame, with his uniform blocks (NaN-free apart from integer masks in block 9, as on clean frames) and
+    vertex buffer (unchanged between record and completion) as the game wrote them.
+  - It depends on the frame rate, not on a race: at a fixed 30 fps there are none (0 of 53 shots), at about 38 fps the
+    frames alternate between one and two vsync ticks and the NaN comes on the alternate frames. Hookshot sees the same
+    (its "dark frames": 5% at speed, none at 33 fps; read for behaviour only).
+  - Fix: the pacer holds whole rates (`nvn_api_obj.c`, adaptive interval): 30 fps while the work misses 60 Hz frames
+    (8 in a row over 18 ms), 60 again when it averages under 13 ms for 180 frames. Walk: 0 black of 53 shots, the level
+    at 30 fps (it was about 38, uneven); the title still runs at 60. `OOT_PRESENT_INTERVAL=0` turns it off, `=<n>` paces
+    at n ticks always.
+  - Ruled out on the way: occlusion conditions (`OOT_COND_RENDER=1` turns the picture white; waiting for every report
+    of an earlier submission waited once a run), the exposure meter `0x25a4c7f00` (reads 1/1024 every frame), mirror
+    write-back (import mode has them too), read-back pages refreshed into the mirror (Hookshot's e84d467; no change),
+    the uniform snapshot (`OOT_UBO_SNAPSHOT=0`: fewer NaN frames, not none), Ryujinx's ignored `.FMZ` (our lowering
+    refuses SM86 `.DNZ` FFMA and FMUL, so no lowered fp32 multiply needs it).
+  - Left: the white spikes from Link while he moves (stretched triangles), at 30 fps too.

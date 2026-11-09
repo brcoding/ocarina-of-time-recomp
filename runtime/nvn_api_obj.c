@@ -836,9 +836,72 @@ NVN_API(nvnWindowSetCrop) {
 // ready, at most at the frame limit (OOT_FPS_LIMIT: 30 to 360 per second or the monitor's rate): holding it to the
 // 2nd or 3rd tick would only add latency and 50 ms frames.
 #define VSYNC_HZ 60ull
+// ---- Adaptive interval
+// The game asks for interval 1 (60 Hz) and, on the level, this port gives it about 38 fps: frames of one and of two
+// vsync ticks alternate, and the game's frame timing alternates with them. On those frames Link's material shader
+// writes NaN into his colour target, which the bloom and the upscaler spread over the whole picture, and the tone
+// map makes it black: 4 of 17 shots on the recorded walk were black frames with only the HUD (build/logs/walk.txt,
+// 2026-11-08; OOT_DUMP_TRACE showed the NaN first in Link's layer, every other frame). At a steady 60 or 30 fps there
+// are none: OOT_GPU_AHEAD=0 (about 13 fps) and a fixed interval of 2 both remove them (0 of 53 shots). Hookshot finds
+// the same frame-rate dependence (its "dark frames", none at 33 fps; read for behaviour only). So the pacer holds
+// whole frame rates: when the game's work keeps missing a 60 Hz frame (AP_UP_N frames in a row over AP_UP_MS), it
+// paces at interval 2 (30 fps, as a console game that cannot hold 60 shows every frame for two vsyncs); when the
+// average work fits well inside one tick again (AP_DOWN_MS over AP_DOWN_N frames), back to the game's interval.
+// Work is the time between presents less what the acquires waited (the pacer and the GPU bound). OOT_PRESENT_INTERVAL:
+// unset or "auto" adaptive, 0 the game's interval always, n > 0 that many ticks always.
+#define AP_UP_MS 18.0
+#define AP_UP_N 8
+#define AP_DOWN_MS 13.0
+#define AP_DOWN_N 180
+static int ap_mode = -2;                 // -1 adaptive, 0 the game's interval, n > 0 fixed
+static int ap_ticks = 1, ap_streak;      // adaptive: the interval paced at, frames in a row that argue for a change
+static uint64_t ap_last_present;
+static volatile LONG64 ap_wait_ns;       // acquire waits since the last present
+static double ap_work_ema;
+
+static void ap_init(void) {
+    if (ap_mode != -2) return;
+    const char *e = cfg_get("OOT_PRESENT_INTERVAL");
+    ap_mode = !e || !*e || !strcmp(e, "auto") ? -1 : atoi(e) < 0 ? 0 : atoi(e);
+    if (ap_mode == -1) rt_log("nvn: present interval adaptive: 60 fps, or 30 while frames miss 60 (OOT_PRESENT_INTERVAL)");
+    else if (ap_mode > 0) rt_log("nvn: OOT_PRESENT_INTERVAL=%d: presents paced to %d of 60 Hz", ap_mode, ap_mode);
+}
+
+// At each present, before its slot is taken: the work of the frame that ends here decides the interval.
+static void ap_present(uint64_t now) {
+    ap_init();
+    uint64_t wait = (uint64_t)InterlockedExchange64(&ap_wait_ns, 0);
+    if (ap_mode != -1 || !ap_last_present) {
+        ap_last_present = now;
+        return;
+    }
+    uint64_t gap = now - ap_last_present;
+    ap_last_present = now;
+    if (gap > 250000000ull) return;   // loading or a stall: not a frame's work
+    double work = (gap > wait ? (double)(gap - wait) : 0.0) / 1e6;
+    ap_work_ema = ap_work_ema ? 0.9 * ap_work_ema + 0.1 * work : work;
+    if (ap_ticks == 1) {
+        ap_streak = work > AP_UP_MS ? ap_streak + 1 : 0;
+        if (ap_streak >= AP_UP_N) {
+            ap_ticks = 2, ap_streak = 0;
+            rt_log("nvn: frames miss 60 Hz (work %.1f ms on average): pacing at 30 fps", ap_work_ema);
+        }
+    } else {
+        ap_streak = ap_work_ema < AP_DOWN_MS ? ap_streak + 1 : 0;
+        if (ap_streak >= AP_DOWN_N) {
+            ap_ticks = 1, ap_streak = 0;
+            rt_log("nvn: frames fit 60 Hz again (work %.1f ms on average): pacing at 60 fps", ap_work_ema);
+        }
+    }
+}
+
 static uint64_t present_period(const win_t *o) {
     if (frame_step_realtime()) return frame_step_cap_ns();
-    return (o->interval > 0 ? (uint64_t)o->interval : 1ull) * 1000000000ull / VSYNC_HZ;
+    ap_init();
+    uint64_t ticks = o->interval > 0 ? (uint64_t)o->interval : 1ull;
+    if (ap_mode > 0) ticks = (uint64_t)ap_mode;
+    else if (ap_mode == -1 && (uint64_t)ap_ticks > ticks) ticks = (uint64_t)ap_ticks;
+    return ticks * 1000000000ull / VSYNC_HZ;
 }
 
 // MacNativeGames nvn_pace.h: the present slot is the previous slot plus one period. Early: wait for the slot. Late by
@@ -873,6 +936,7 @@ NVN_API(nvnWindowAcquireTexture) {
     int idx = o->active ? o->next++ % o->active : 0;
     *out = idx;
     uint64_t at = idx < 4 ? o->avail[idx] : 0;
+    uint64_t w0 = kern_now_ns();   // ap_present: what the acquire waits is not the frame's work
     if (at) {
         uint64_t p0 = perf_begin();
         sleep_until(at);
@@ -913,6 +977,7 @@ NVN_API(nvnWindowAcquireTexture) {
         }
         b->cpu_synced(f);
     }
+    InterlockedAdd64(&ap_wait_ns, (LONG64)(kern_now_ns() - w0));
     if (s) {
         s->fenced = f ? 1 : 3;
         s->fence = f;
@@ -933,7 +998,9 @@ NVN_API(nvnQueuePresentTexture) {
         rt_fatal("nvn: QueuePresentTexture of image %d on window %p", idx, (void *)o);
     o->presents++;
     const tex_t *t = (const tex_t *)o->tex[idx];
-    uint64_t period = present_period(o), now = kern_now_ns();
+    uint64_t now0 = kern_now_ns();
+    ap_present(now0);
+    uint64_t period = present_period(o), now = now0;
     uint64_t slot = now + pace(&o->pace, now, period);
     gfx_backend()->present(t, o->crop, slot);
     o->ticket[idx] = o->presents;

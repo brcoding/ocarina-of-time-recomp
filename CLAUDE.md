@@ -59,7 +59,12 @@ sky showing through; the culling chain's indirect records are written by the gam
 `main+0x2bfd340`) from what it reads back out of pass 0's output (`0x29bb9c000`, via `main+0x2bfd750`), and it
 reads 0 (`docs/level.md`). The game embeds Lua, whose errors longjmp: `runtime/sjlj.c` with recomp/gen.py's
 `RT_SETJMP` at every call to a setjmp PLT stub (since d105aa9; before it the game died at `main+0x1661690`).
-Long runs need memory headroom: the game commits about 21 GB on the level.
+Long runs need memory headroom: the game commits about 21 GB on the level. The black frames while walking (NaN from Link's
+material pass spread by bloom and the upscaler) come from an uneven frame rate between 30 and 60, not from a CPU/GPU
+race: the pacer now holds 30 fps while frames miss 60 Hz (`nvn_api_obj.c`, adaptive interval; `OOT_PRESENT_INTERVAL=0`
+off, `=<n>` fixed), `docs/level.md` Status, 2026-11-08 night. Lesson from it: anything that slows the frame (dumps,
+`--shot`, screenshots every frame, `OOT_GPU_AHEAD=0`) hides frame-rate-dependent glitches; use `OOT_DUMP_TRACE` to
+look at them.
 `python3.14 tools/shader_census.py --version v131072 --lower` lowers the whole corpus (14,363 programs) and lists
 the refusals in `build/v131072/shaders/lowered.txt`.
 
@@ -89,6 +94,9 @@ the refusals in `build/v131072/shaders/lowered.txt`.
     switch matches the code hash instead (`OOT_TENSOR_ONLY`, `tools/kernel.py` prints it).
   - `--shot` builds pipelines synchronously, so screenshot runs are slower than normal ones.
   - A relative `OOT_DUMP_DIR` or `OOT_SHADER_CACHE` is relative to the repo (run.py passes them with `/p`).
+  - `OOT_DUMP_TRACE=<lo>-<hi>` logs the centre and corner (mean, NaN count) of every large target of those presents
+    without slowing the frame; `OOT_DUMP_TRACE_DRAWS=a<addr>` adds a sample after every draw into the target at addr,
+    with the draw's shader, uniform blocks and whether its vertex buffer changed after the submit.
   - `OOT_CS_TIME=1` logs the GPU time per compute shader; `OOT_TRACE=perf` the GPU time per frame and what bounds it;
     `OOT_CS_INFO=1` (AMD) each compute pipeline's VGPRs, scratch and LDS (`=isa` the disassembly); `OOT_CS_BUILD_ONLY=1`
     with `--probe-cs` a kernel's cold build without running it. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the

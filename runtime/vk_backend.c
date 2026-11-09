@@ -542,10 +542,17 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
             memcpy(b, w, size < 16 ? size : 16);
             uint64_t f = vk_sync_latest();
             if (rb_wait && f && vk_sync_fence_done() < f) vk_sync_fence_wait(f, UINT64_MAX);
-            rt_log("vk: readback %#llx+%#llx frame %llu (fence %llu): %08x %08x %08x %08x -> %08x %08x %08x %08x",
+            // and the nonzero words of the whole range: how many, the first four with their offsets
+            char nz[160] = "";
+            int nn = 0, len = 0;
+            for (uint64_t i = 0; i < size / 4; i++)
+                if (w[i] && nn++ < 4 && len < (int)sizeof nz - 24)
+                    len += snprintf(nz + len, sizeof nz - (size_t)len, " +%llx=%08x", (unsigned long long)i * 4, w[i]);
+            rt_log("vk: readback %#llx+%#llx frame %llu (fence %llu): %08x %08x %08x %08x -> %08x %08x %08x %08x; "
+                   "nonzero %d:%s",
                    (unsigned long long)addr, (unsigned long long)size, (unsigned long long)gfx_counters.frames,
                    (unsigned long long)f, b[0], b[1], b[2], b[3], size > 0 ? w[0] : 0, size > 4 ? w[1] : 0,
-                   size > 8 ? w[2] : 0, size > 12 ? w[3] : 0);
+                   size > 8 ? w[2] : 0, size > 12 ? w[3] : 0, nn, nz);
         }
     }
     if (rb_wait && gfx_replay_async() && vk_gpu_wrote_pages(addr, size)) {

@@ -58,8 +58,9 @@ static int arm_on_dispatch;            // OOT_DUMP=dispatch: the frame of the fi
 static char arm_cs[17];                // OOT_DUMP=cs:<hex>: ... of the first dispatch of a shader whose input id starts so
 static int draws_pass = -1, in_draw_copy;   // OOT_DUMP_DRAWS=<pass>: colour target 0 copied after every draw of that pass
 static uint64_t draws_depth;                 // OOT_DUMP_DRAWS=d<addr>: ... of every pass whose depth target is at <addr>
-static int dump_vb;
-static int xfb_probe;                  // OOT_DUMP_XFB_PROBE=1: the vertex outputs of every draw of the OOT_DUMP_DRAWS pass, captured                    // OOT_DUMP_VB=1: the vertex streams of every draw of the dump frame, as guest memory holds them
+static int64_t dump_at_us = -1;              // OOT_DUMP=@<ms>: the first frame after that much game time (the world clock)
+static int dump_vb;                    // OOT_DUMP_VB=1: the vertex streams of every draw of the dump frame, as guest memory holds them
+static int xfb_probe;                  // OOT_DUMP_XFB_PROBE=1: the vertex outputs of every draw of the OOT_DUMP_DRAWS pass, captured
 static uint32_t want_tex[16][2];       // OOT_DUMP_TEX: slot id and 0, or width and height
 static int nwant_tex;
 static uint64_t last_targets;          // targets_sig of the last render pass; 0 after a dispatch
@@ -358,6 +359,92 @@ static const char *copy_region(VkExec *ex, VkImage image, VkFormat vf, VkImageAs
 static const char *copy_out(VkExec *ex, VkImage image, VkFormat vf, VkImageAspectFlags aspect, uint32_t level,
                             uint32_t layer, uint32_t w, uint32_t h, uint32_t d, const char *name) {
     return copy_region(ex, image, vf, aspect, level, layer, 0, (VkExtent3D){w, h, d}, w, h, d, name);
+}
+
+// ---- OOT_DUMP_TRACE=<lo>-<hi> (diagnostic): for the presents lo..hi, the colour target 0 of every render pass and
+// every storage image a dispatch writes, at least 1280 texels wide, gets a 16x16 block at its centre and one at (0,0)
+// copied to a host buffer; at its fence one line "trace: present P #k <what> WxH fmt: centre mean r g b, corner ...,
+// nan/inf n" is logged. No files, no wait: the CPU and GPU keep their overlap, unlike a dump or a screenshot, so a
+// glitch that comes from it (whole black frames while walking, 2026-11-08) shows in which pass the picture goes wrong.
+// P counts presents in replay order (vk_dump_present), as OOT_SHOTS names its files.
+// OOT_DUMP_TRACE_DRAWS=<k>|a<addr>: in those presents, also after every draw of trace pass k (its #k), or of every
+// pass whose colour target 0 is at addr, labelled with the draw's index in the pass and its fragment shader, to find
+// the draw that writes a bad value.
+static uint64_t tr_lo, tr_hi, tr_frame, tr_fs, tr_draws_addr;
+static int tr_seq, tr_draws_pass = -1, tr_draw, tr_pending_vb;
+static char tr_ctx[400];   // the traced draw's vertex buffer 0 and vertex-stage uniform blocks
+static uint64_t tr_vb, tr_vb_n, tr_vb_hash;   // its vertex buffer 0 and the hash of its bytes at the draw (record time)
+static uint64_t tr_hash(uint64_t a, uint64_t n) {
+    uint64_t h = 1469598103934665603ull;
+    const uint64_t *w = (const uint64_t *)(uintptr_t)a;
+    for (uint64_t i = 0; i < n / 8; i++) h = (h ^ w[i]) * 1099511628211ull;
+    return h;
+}
+typedef struct { VkBuffer buf; VmaAllocation alloc; const uint8_t *map; const Fmt *f; uint64_t frame; int seq;
+                 uint32_t w, h; char what[480]; uint64_t vb, vb_n, vb_hash; } TrJob;
+#define TR_B 16
+
+static void tr_done(void *arg) {
+    TrJob *j = arg;
+    VmaAllocator vma = vk_ctx()->vma;
+    vmaInvalidateAllocation(vma, j->alloc, 0, VK_WHOLE_SIZE);
+    double m[2][3] = {{0}};
+    int bad = 0;
+    for (int b = 0; b < 2; b++)
+        for (int i = 0; i < TR_B * TR_B; i++) {
+            float o[4];
+            decode(j->f, j->map + ((size_t)b * TR_B * TR_B + (size_t)i) * j->f->bytes, o);
+            for (int c = 0; c < 3; c++) {
+                if (!(o[c] == o[c]) || o[c] > 65504.f || o[c] < -65504.f) bad++;
+                else m[b][c] += o[c] / (TR_B * TR_B);
+            }
+        }
+    // the traced draw's vertex buffer: did guest memory change between the draw's recording and the GPU's completion?
+    const char *vbs = !j->vb ? "" : tr_hash(j->vb, j->vb_n) != j->vb_hash ? ", vb changed after the submit" : ", vb same";
+    rt_log("trace: present %llu #%d %s %ux%u %s: centre %.4g %.4g %.4g, corner %.4g %.4g %.4g, nan/inf %d%s",
+           (unsigned long long)j->frame, j->seq, j->what, j->w, j->h, j->f->name, m[0][0], m[0][1], m[0][2], m[1][0],
+           m[1][1], m[1][2], bad, vbs);
+    vmaDestroyBuffer(vma, j->buf, j->alloc);
+    free(j);
+}
+
+static void tr_copy(VkExec *ex, VkImage image, VkFormat vf, VkImageAspectFlags aspect, uint32_t level, uint32_t layer,
+                    uint32_t w, uint32_t h, const char *what) {
+    if (!tr_hi || tr_frame < tr_lo || tr_frame > tr_hi || w < 1280 || h < TR_B || !(aspect & VK_IMAGE_ASPECT_COLOR_BIT))
+        return;
+    const Fmt *f = fmt_of(vf);
+    if (!f || f->kind == K_D16 || f->kind == K_D24 || f->kind == K_D32F) return;
+    TrJob *j = calloc(1, sizeof *j);
+    if (!j) rt_fatal("vk_dump: out of memory");
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 2ull * TR_B * TR_B * f->bytes,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    VmaAllocationInfo info;
+    if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &j->buf, &j->alloc, &info) != VK_SUCCESS || !info.pMappedData) {
+        free(j);
+        return;
+    }
+    j->map = info.pMappedData, j->f = f, j->frame = tr_frame, j->seq = tr_seq++, j->w = w, j->h = h;
+    snprintf(j->what, sizeof j->what, "%s", what);
+    if (tr_pending_vb) j->vb = tr_vb, j->vb_n = tr_vb_n, j->vb_hash = tr_vb_hash, tr_pending_vb = 0;
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    VkBufferImageCopy r[2] = {
+        {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+         .imageOffset = {(int32_t)(w / 2 - TR_B / 2), (int32_t)(h / 2 - TR_B / 2), 0}, .imageExtent = {TR_B, TR_B, 1}},
+        {.bufferOffset = (VkDeviceSize)TR_B * TR_B * f->bytes, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+         .imageExtent = {TR_B, TR_B, 1}}};
+    vkCmdCopyImageToBuffer(ex->cb, image, VK_IMAGE_LAYOUT_GENERAL, j->buf, 2, r);
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT;
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded += 3;
+    vk_completion_add(ex->fence, tr_done, j);
 }
 
 // ---- OOT_DUMP_BUF=<addr>:<size>[:<off>:<stride>:<w>:<h>]: after every pass and dispatch that is logged, the GPU
@@ -852,6 +939,37 @@ void vk_dump_indices(uint64_t addr, int itype, int count) {
 }
 
 void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info) {
+    if (tr_draws_pass >= 0 && tr_hi && tr_frame >= tr_lo && tr_frame <= tr_hi && ex->color[0].tex &&
+        (tr_draws_addr ? (uint64_t)(uintptr_t)ex->color[0].tex->mem == tr_draws_addr : tr_seq == tr_draws_pass)) {
+        tr_fs = shader_hash(s->fs);
+        // each vertex- and fragment-stage uniform block as the GPU reads it (the submission's snapshot, else memory):
+        // its address and, when it holds any, how many NaN or infinite floats
+        tr_vb = tr_vb_n = 0;
+        VkMemSpan vm;
+        uint64_t va = ex->vbuf[0].address, vn = ex->vbuf[0].size;
+        if (va && vn && vn <= (16u << 20) && !nvn_gpu_only(va) && vk_mem_resolve(va, vn, &vm))
+            tr_vb = va, tr_vb_n = vn & ~7ull, tr_vb_hash = tr_hash(va, tr_vb_n);
+        int n = snprintf(tr_ctx, sizeof tr_ctx, "vb %llx+%llx ubo", (unsigned long long)va, (unsigned long long)vn);
+        for (int st = 0; st < 2; st++)
+            for (int k = 1; k < 16 && n < (int)sizeof tr_ctx - 40; k++) {
+                uint64_t a = ex->ubo[st][k].addr, z = ex->ubo[st][k].size;
+                if (!a) continue;
+                if (z > 0x10000) z = 0x10000;
+                const uint32_t *w = vk_usnap_peek(a, z);
+                int snap = w != NULL;
+                VkMemSpan m;
+                if (!w && vk_mem_resolve(a, z, &m) && !nvn_gpu_only(a)) w = (const uint32_t *)(uintptr_t)a;
+                int bad = 0;
+                char where[64] = "";
+                for (uint64_t i = 0, wl = 0; w && i < z / 4; i++)
+                    if ((w[i] & 0x7f800000u) == 0x7f800000u && bad++ < 4 && wl < sizeof where - 16)
+                        wl += (uint64_t)snprintf(where + wl, sizeof where - wl, "@%llx=%08x", (unsigned long long)i * 4, w[i]);
+                if (st == 1 && k != 9) continue;   // the fragment stage's blocks repeat the vertex stage's
+                n += snprintf(tr_ctx + n, sizeof tr_ctx - (size_t)n, " %s%d=%llx%s", st ? "f" : "v", k,
+                              (unsigned long long)a, !w ? "?" : snap ? "" : "m");
+                if (bad) n += snprintf(tr_ctx + n, sizeof tr_ctx - (size_t)n, ":NAN%d%s", bad, where);
+            }
+    }
     AcquireSRWLockExclusive(&rec_lock);
     if (!active()) goto out;
     pass_draws++;
@@ -992,6 +1110,25 @@ const char *vk_dump_dir(void) { return dir; }
 int vk_dump_pass_seq(void) { return seq; }
 
 void vk_dump_after_draw(VkExec *ex) {
+    if (!in_draw_copy && tr_draws_pass >= 0 && ex->color[0].tex &&
+        (tr_draws_addr ? (uint64_t)(uintptr_t)ex->color[0].tex->mem == tr_draws_addr : tr_seq == tr_draws_pass) && tr_hi && tr_frame >= tr_lo && tr_frame <= tr_hi &&
+        ex->color[0].image && ex->color[0].width >= 1280 && !ex->color[0].blocks && !ex->color[0].is3d) {
+        in_draw_copy = 1;
+        int reopen;
+        VkCommandBuffer cb = vk_exec_inline_begin(&reopen);
+        if (cb) {
+            const VkExecTarget *t = &ex->color[0];
+            char what[480];
+            snprintf(what, sizeof what, "draw %d fs %016llx %s of pass", tr_draw, (unsigned long long)tr_fs, tr_ctx);
+            int keep = tr_seq;
+            tr_pending_vb = 1;
+            tr_copy(ex, t->image, t->format, t->aspect, t->level, t->base_layer, t->width, t->height, what);
+            tr_seq = keep;   // the pass keeps its number
+            vk_exec_inline_end(reopen);
+        }
+        in_draw_copy = 0;
+        tr_draw++;
+    }
     if (in_draw_copy || (draws_pass < 0 && !draws_depth)) return;
     AcquireSRWLockExclusive(&rec_lock);
     int mine = draws_depth ? ex->depth.tex && (uint64_t)(uintptr_t)ex->depth.tex->mem == draws_depth : seq == draws_pass;
@@ -1024,6 +1161,14 @@ void vk_dump_after_draw(VkExec *ex) {
 
 void vk_dump_pass_end(VkExec *ex) {
     if (in_draw_copy) return;   // the pass is closed around a draw copy, not ended
+    tr_draw = 0;
+    if (tr_hi) {
+        const VkExecTarget *t = &ex->color[0];
+        char what[64];
+        snprintf(what, sizeof what, "pass %u draws %d", tr_seq, pass_draws);
+        if (t->tex && t->image && !t->blocks && !t->is3d && t->samples <= 1)
+            tr_copy(ex, t->image, t->format, t->aspect, t->level, t->base_layer, t->width, t->height, what);
+    }
     AcquireSRWLockExclusive(&rec_lock);
     if (!active()) goto out;
     int n = seq++;
@@ -1055,6 +1200,21 @@ out:
 
 void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPipeInfo *info, const p_dispatch *d) {
     (void)p;
+    for (uint32_t i = 0; tr_hi && i < info->n_bindings; i++) {   // OOT_DUMP_TRACE: storage images the dispatch writes
+        const VkPipeBinding *bd = &info->bindings[i];
+        if (!bd->res || bd->kind != GFX_RES_IMG || !(bd->res->flags & 4) || bd->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            continue;
+        uint64_t h = vk_exec_res_handle(ex, 5, bd->res, 0, 1);
+        view_t v;
+        int hv = 0;
+        const VkTexImage *t = h ? vk_texture_by_id(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
+        if (!t || t->type == VK_IMAGE_TYPE_3D || t->samples > 1) continue;
+        uint32_t lv = hv && v.set_levels ? v.base_level : 0, layer = hv && v.set_layers ? v.min_layer : 0;
+        if (lv >= t->levels || layer >= t->layers) continue;
+        char what[64];
+        snprintf(what, sizeof what, "cs %016llx", (unsigned long long)shader_hash(cs));
+        tr_copy(ex, t->image, t->format, t->aspect, lv, layer, t->width >> lv, t->height >> lv, what);
+    }
     AcquireSRWLockExclusive(&rec_lock);
     if (arm_on_dispatch && dump_frame == UINT64_MAX && arm_cs[0]) {
         char hex[17];
@@ -1212,6 +1372,17 @@ static void make_dirs(char *path) {
 }
 
 void vk_dump_init(void) {
+    const char *tr = cfg_get("OOT_DUMP_TRACE");
+    if (tr && *tr && sscanf(tr, "%llu-%llu", (unsigned long long *)&tr_lo, (unsigned long long *)&tr_hi) == 2 && tr_hi) {
+        vk_dump_armed = 1;   // the hooks run; no dump frame, so active() stays 0
+        const char *td = cfg_get("OOT_DUMP_TRACE_DRAWS");
+        if (td && *td == 'a') tr_draws_addr = strtoull(td + 1, NULL, 0), tr_draws_pass = 0;
+        else if (td && *td) tr_draws_pass = atoi(td);
+        rt_log("vk_dump: OOT_DUMP_TRACE: centre and corner of the large targets of presents %llu-%llu",
+               (unsigned long long)tr_lo, (unsigned long long)tr_hi);
+    } else {
+        tr_hi = 0;
+    }
     const char *e = cfg_get("OOT_DUMP");
     if (e && !strcmp(e, "xfb")) arm_on_xfb = 1, dump_frame = UINT64_MAX;
     else if (e && !strcmp(e, "when")) arm_on_call = 1, dump_frame = UINT64_MAX;
@@ -1220,6 +1391,8 @@ void vk_dump_init(void) {
         arm_on_dispatch = 1, dump_frame = UINT64_MAX;
         snprintf(arm_cs, sizeof arm_cs, "%s", e + 3);
     }
+    // @<ms>: by game time (frame_step_world_us), which a recorded session's timed events follow, as frame numbers do not
+    else if (e && *e == '@') dump_at_us = (int64_t)(strtod(e + 1, NULL) * 1000.0), dump_frame = UINT64_MAX;
     else if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
     const char *lf = cfg_get("OOT_DUMP_LOG");
     if (lf && *lf) log_from = strtoull(lf, NULL, 10);
@@ -1291,6 +1464,12 @@ void vk_dump_arm(uint64_t frame) {
 }
 
 void vk_dump_present(uint64_t frame) {
+    tr_frame = frame + 1, tr_seq = 0;
+    if (dump_at_us >= 0 && dump_frame == UINT64_MAX && frame_step_world_us() >= dump_at_us) {
+        dump_frame = frame + 1;
+        rt_log("vk_dump: game time %.1f s reached: dumping frame %llu", frame_step_world_us() / 1e6, (unsigned long long)dump_frame);
+        return;
+    }
     if (frame != dump_frame) return;
     AcquireSRWLockExclusive(&rec_lock);
     finished = 1;
