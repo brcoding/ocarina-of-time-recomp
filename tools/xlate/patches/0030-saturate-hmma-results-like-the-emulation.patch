@@ -1,0 +1,41 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1382,12 +1382,28 @@
+             {
+                 SpvInstruction cw = context.FConvert(v2f32, context.Bitcast(v2f16, regs[6 + w]));
+                 SpvInstruction sum = context.FAdd(v2f32, context.CompositeConstruct(v2f32, dq[2 * w], dq[2 * w + 1]), cw);
+-                words[w] = context.Bitcast(u32, context.FConvert(v2f16, sum));
++                words[w] = context.Bitcast(u32, HalfFromSingle(context, sum));
+             }
+ 
+             SpvInstruction result = context.CompositeConstruct(context.TypeVector(u32, 2), words[0], words[1]);
+ 
+             return new OperationResult(AggregateType.U32 | AggregateType.Vector2, result);
++        }
++
++        // The f32 result to f16 as the emulated HMMA rounds it (ocarina-of-time-recomp): beyond half precision it becomes
++        // +-65504, not +-infinity (Ryujinx's half packing, which the emulation's HFMA2 ends in, rounds toward zero on AMD
++        // and so saturates); NaN stays NaN (the comparisons are false for it). Without this an HMMA result that overflows
++        // became infinity, and a later layer's infinity minus infinity NaN: the TAAU upscaler's top-left corner on the
++        // level, in about a third of the presents (docs/phase3.md 2026-11-09).
++        private static SpvInstruction HalfFromSingle(CodeGenContext context, SpvInstruction v2)
++        {
++            SpvInstruction f32 = context.TypeFP32(), v2f32 = context.TypeVector(f32, 2), v2bool = context.TypeVector(context.TypeBool(), 2);
++            SpvInstruction hi = context.ConstantComposite(v2f32, context.Constant(f32, 65504f), context.Constant(f32, 65504f));
++            SpvInstruction lo = context.ConstantComposite(v2f32, context.Constant(f32, -65504f), context.Constant(f32, -65504f));
++            SpvInstruction x = context.Select(v2f32, context.FOrdGreaterThan(v2bool, v2, hi), hi, v2);
++            x = context.Select(v2f32, context.FOrdLessThan(v2bool, x, lo), lo, x);
++
++            return context.FConvert(context.TypeVector(context.TypeFloat(16), 2), x);
+         }
+ 
+         // The lowered pair of HMMA.16816.F16 that read the same A (runtime/sm86_lower.c hmma_plan; InstEmit.Mma, bits 49
+@@ -1540,7 +1556,7 @@
+                 {
+                     SpvInstruction lo = context.CompositeExtract(f32, d, 2 * w);
+                     SpvInstruction hi = context.CompositeExtract(f32, d, 2 * w + 1);
+-                    words[w] = context.Bitcast(u32, context.FConvert(v2f16, context.CompositeConstruct(v2f32, lo, hi)));
++                    words[w] = context.Bitcast(u32, HalfFromSingle(context, context.CompositeConstruct(v2f32, lo, hi)));
+                 }
+             }
+ 

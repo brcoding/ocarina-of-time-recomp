@@ -545,8 +545,9 @@ named by their input ids from before the shared-memory change, which changed eve
   most 3 of 255 (`combo-series30-{3,0}`). The level route (`--replay build/logs/a-spam.txt --skip-movies`, 200 s,
   warm, a shot every 2 s from 120 s): with the pacer 30 fps and the scene drawn in 41 shots of 41
   (`combo-level-paced`, the same dark spot as `lds2-level30-*`); unpaced (`OOT_PRESENT_INTERVAL=0`) 50 fps, bound by
-  the CPU, 11.6 ms of GPU a frame and about 2.6 ms of compute in 60 kernels, none of them HMMA kernels
-  (`combo-level-unpaced`).
+  the CPU, 11.6 ms of GPU a frame and about 2.6 ms of compute in 60 kernels (`combo-level-unpaced`); among them one
+  HMMA kernel, the TAAU upscaler 406ecfce [866197aa], 0.196 ms a frame, whose 176 HMMAs the plan makes 74 pairs (13
+  with chained accumulators). This route stays indoors; the NaN that kernel made on AMD is the next status.
 - **Not built: a re-layout through shared memory** (stores, a barrier, OpCooperativeMatrixLoad). Loading A and B in
   the AMD layout from the program's own LDSM tiles moves no data the program does not already load, needs no shared
   memory beyond what the kernel declares, and leaves no store-load round trip on the chain.
@@ -556,6 +557,28 @@ named by their input ids from before the shared-memory change, which changed eve
 Open: the f16 accumulator saves 0.7 ms a frame (the kernels 18%) but rounds within an ulp of once rather than once;
 native A loads come out as four `ds_load_b32` (the translator's LDS.128 is four word loads the driver does not merge);
 63f42c62's prologue spills; 197ec50b, half of whose pairs still convert A and B, is the largest kernel now.
+
+## Status (2026-11-09, night): NaN from AMD's HMMA results beyond half precision
+
+On the RX 9070 XT the TAAU upscaler 406ecfce [866197aa] made NaN of its own on the level: a patch of about 9x9 texels
+at the top-left corner of its 2560x1440 output, in a third of the presents in Link's house and 9% of Kokiri's outdoor
+walk (`build/logs/ak-walk.txt`, presents 2500-9000 with `OOT_DUMP_TRACE`, `OOT_ASTC_BC=1`; a present counts when the
+upscaler's output is the first traced target with NaN). The cause is an HMMA result beyond half precision: the
+16x16x16 path (patches 0027, 0028) converted its f32 result to f16 rounding to nearest, so it became infinity, and a
+later layer's infinity minus infinity NaN. The emulated HMMA ends in Ryujinx's half packing, which on AMD rounds
+toward zero and so saturates at 65504. Patch 0030 (`HalfFromSingle`) clamps the f32 result to +-65504 before the
+conversion, in the single and the pair generators; NaN stays NaN.
+
+- Outdoor walk on #18 + #20 + #19's pacer (`--alone`, 330 s): the upscaler starts the NaN in 603 of 6501 presents
+  before (run-135), in 12 with patch 0030 (run-152) and in 16 with that kernel emulated (run-138). Black presents
+  4.81% before and 4.31% after: the rest starts elsewhere, 367 of them in 1cb856c3 (no HMMA).
+- Found with a test-only `OOT_DUMP_TRACE` addition that names the sampled texels: always the corner block's x 0-8,
+  y 0-8. Ruled out on the way: lanes that had exited (its HMMAs run after a BSYNC and before its exits), undefined
+  registers (no OpUndef in its SPIR-V), the AST optimizer moving subgroup operations (none in tensor kernels), stale
+  shared memory (zeroing it at the start left the corner NaN) and the compiler reordering its store-then-load
+  exchange without a barrier (the AMD code keeps the order).
+- `--probe-tensor` (rounding still once in 512 of 512 halves) and `--probe-coopmat` pass; the title at 30 s scores 0.46
+  (`build/logs/hm-sat-title-30.png`). No lowering change, so no KEY_VERSION bump: the translator identity re-keys.
 
 ## Status (2026-11-08, evening): the flickering level and the occlusion counts
 
