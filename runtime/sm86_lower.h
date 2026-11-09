@@ -13,6 +13,7 @@ typedef struct {
     uint32_t c1_len;
     uint32_t error_offset;     // byte offset of the SM86 instruction that could not be lowered, from the start
                                // of the code block (header included)
+    uint32_t shared_insns;     // the program's shared memory instructions (LDS, STS, LDSM)
     char error[96];            // empty when the lowering succeeded
 } Sm86Lowered;
 
@@ -40,6 +41,11 @@ typedef struct {
     uint32_t stage;            // NVN's enum at byte +0x56: 0 vertex, 1 fragment, 2 geometry, 3 tess control,
                                // 4 tess eval, 5 compute, 6 task, 7 mesh
     uint32_t local[3];         // compute: the workgroup size (+0x58)
+    uint32_t shared;           // compute: the shared memory the program declares, in bytes (+0x64). Measured
+                               // 2026-11-08 over the census's 251 compute programs and the 121 play stored (the
+                               // upscaler's among them): 0 in exactly those without LDS/STS/LDSM, else above every
+                               // immediate offset they use (and in the census a multiple of the workgroup size:
+                               // 96 x 84 = 8064, 512 x 36 = 18432). Task and mesh programs use the word otherwise.
 } Sm86Control;
 // 0 when the magic or the bounds are wrong.
 int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Control *c);

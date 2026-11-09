@@ -18,8 +18,9 @@ The NVN2 control section (measured over the corpus, 2026-11-05; see docs/phase3.
 the end of the instructions at +0x38 (header + instructions), the length of the jump-table constants at +0x3c, their
 offset in the code at +0x40, the whole code block's size at +0x44, the stage at byte +0x56 (NVN's enum: 0 vertex,
 1 fragment, 2 geometry, 3 tess control, 4 tess eval, 5 compute, plus 6 task and 7 mesh), and for compute the workgroup
-size at +0x58/+0x5c/+0x60. The bytes past +0xe0 describe the jump tables: a u32 count, then 16-byte records {BRX
-instruction offset in the code, entry count, 0x10000, byte offset of the table in c1}; +0xdc is the size they use.
+size at +0x58/+0x5c/+0x60 and the shared memory it declares at +0x64 (bytes; 2026-11-08). The bytes past +0xe0
+describe the jump tables: a u32 count, then 16-byte records {BRX instruction offset in the code, entry count, 0x10000,
+byte offset of the table in c1}; +0xdc is the size they use.
 Graphics code starts with the 0x80-byte Turing+ program header (Maxwell's is 0x50); compute code starts with its first
 instruction.
 

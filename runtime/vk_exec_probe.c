@@ -1029,11 +1029,11 @@ static int probe_tensor_run(const GfxBackend *b, uint8_t *guest, int *n_bad) {
     uint32_t code_end = (uint32_t)((p - code) * 16), code_size = 512;
     static uint8_t ctl[0x100];
     memset(ctl, 0, sizeof ctl);
-    const uint32_t magic = SM86_CONTROL_MAGIC, ctl_size = SM86_CONTROL_MIN, local[3] = {32, 1, 1};
+    const uint32_t magic = SM86_CONTROL_MAGIC, ctl_size = SM86_CONTROL_MIN, local[3] = {32, 1, 1}, shared = 768;
     memcpy(ctl, &magic, 4), memcpy(ctl + 0x30, &ctl_size, 4), memcpy(ctl + 0xd4, &ctl_size, 4);
     memcpy(ctl + 0x38, &code_end, 4), memcpy(ctl + 0x40, &code_size, 4), memcpy(ctl + 0x44, &code_size, 4);
     ctl[0x56] = 5, ctl[0xb2] = 1;                                              // compute; one storage buffer slot
-    memcpy(ctl + 0x58, local, 12);
+    memcpy(ctl + 0x58, local, 12), memcpy(ctl + 0x64, &shared, 4);           // A and B in shared memory: 512 + 256 bytes
     static prog_t prog;
     memset(&prog, 0, sizeof prog);
     prog.magic = NVN_PROG_MAGIC, prog.serial = 0x7100, prog.nstage = 1;

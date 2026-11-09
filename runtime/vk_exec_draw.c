@@ -827,10 +827,9 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
             memcpy(&l, ctl + 0x58 + 4 * k, 4);
             a->local[k] = (uint16_t)(l ? l : 1);
         }
-    // The shared memory the kernel may use: the NVN2 control section's field for it is not identified yet (none of
-    // its words matches the kernels' STS/LDS/LDSM use), and 0 loses every shared store, so every compute program
-    // gets Maxwell's and Vulkan's common limit; it costs occupancy, not correctness (2026-11-06, docs/phase3.md).
-    if (st == NVN_STAGE_CS) a->shared_bytes = 0xc000;
+    // The shared memory the kernel declares (control +0x64, 2026-11-08): the fixed 48 KB before it cost AMD most of
+    // the wide upscaler kernels' occupancy (docs/phase3.md).
+    if (st == NVN_STAGE_CS) a->shared_bytes = gfx_shader_cs_shared(ctl);
     typeof(AC[0]) *c = &AC[st];
     // The generation and tokens are read before the lookups (one that creates an entry changes them) and unlocked: a
     // registration racing with them is ordered after this draw, and a slot stored under older ones is only looked up
@@ -3182,7 +3181,10 @@ static void cst_end(VkExec *ex, int pair, const GfxShader *cs, const uint32_t gr
 //   the picture is too, build/logs/skip-3f15.png).
 // ace1cec0 runs again since 2026-11-08 night: with the culling counts and the mesh count fixed, the level route shows
 // no blocks and no black scene with it (build/logs/ace-on-level.png), at under 0.2 ms a dispatch.
-#define SKIP_CS_DEFAULT "3f15911a"
+// The prefixes are input ids, which hash the answers: since compute programs are answered the shared memory they
+// declare (2026-11-08, KEY_VERSION 31) 3f15911a is 7b872d67 (ace1cec0 726b17cb; code hashes e44377cb and 80fb2f93,
+// the same programs). A change to the compute answers changes them again.
+#define SKIP_CS_DEFAULT "7b872d67"
 static int skip_cs(const GfxShader *cs) {
     const char *e = getenv("OOT_SKIP_CS");
     if (!e) e = SKIP_CS_DEFAULT;
