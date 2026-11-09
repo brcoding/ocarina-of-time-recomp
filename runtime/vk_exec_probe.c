@@ -1103,14 +1103,146 @@ static int probe_tensor_run(const GfxBackend *b, uint8_t *guest, int *n_bad) {
     return 0;
 }
 
+// The second kernel: HMMAs in pairs that share A, the forms the 16x16x16 mapping's plan (sm86_lower.c hmma_plan) keeps in
+// the AMD layout. A (16x16) through LDSM.x4 from +0 (row addresses at +1024, in R32), B (16x16, k rows of 16) through
+// LDSM.x4.trans from +512 (addresses at +1152, in R33): matrices 0, 1 are B's columns 0-7 (k 0-7, 8-15), 2, 3 columns
+// 8-15. Pair 1 multiplies into zero accumulators R20 (columns 0-7) and R22 (8-15); pair 2 adds the same products to them
+// (C = D: the accumulators stay in the AMD layout between the two); pair 3 loads B again and takes its halves the other
+// way round (R28 = A x B's columns 8-15, R30 = columns 0-7). R20-R23 go to +2048, R28-R31 to +2560 (16 bytes per lane).
+// frac 0: small integers, every result exact. frac 1: values with 6 and 7 fraction bits, whose products need 13: how the
+// device rounds (once per HMMA from the exact sum plus C, as a tensor core, or after every step, as the emulation does);
+// more than two half-precision ulps from rounding once is a failure.
+static int probe_tensor_pairs_run(const GfxBackend *b, uint8_t *guest, int frac, int *n_bad) {
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest + 0x400000, .size = 0x100000,
+                   .game_mem = guest + 0x400000};
+    CHECK(b->pool_init(&pool), "pool_init of a CPU-visible pool for the tensor pairs part");
+    uint8_t *buf = pool.mem;
+    memset(buf, 0, TN_BUF);
+    float A[16][16], B[16][16];
+    double D[16][16];
+    for (int i = 0; i < 16; i++)
+        for (int k = 0; k < 16; k++)
+            A[i][k] = frac ? 1.0f + (float)((i * 7 + k * 3) % 32) / 64 : (float)((i * 5 + k * 3) % 7 - 3);
+    for (int k = 0; k < 16; k++)
+        for (int j = 0; j < 16; j++)
+            B[k][j] = frac ? 1.0f + (float)((k * 5 + j * 11) % 32) / 128 : (float)((k * 3 + j * 7) % 5 - 2);
+    for (int i = 0; i < 16; i++)
+        for (int j = 0; j < 16; j++) {
+            double s = 0;
+            for (int k = 0; k < 16; k++) s += (double)A[i][k] * B[k][j];
+            D[i][j] = s;
+        }
+    uint16_t *ha = (uint16_t *)buf, *hb = (uint16_t *)(buf + 512);
+    for (int i = 0; i < 16; i++)
+        for (int k = 0; k < 16; k++) ha[i * 16 + k] = tn_f2h(A[i][k]), hb[i * 16 + k] = tn_f2h(B[i][k]);
+    uint32_t *addr_a = (uint32_t *)(buf + 1024), *addr_b = (uint32_t *)(buf + 1152);
+    for (uint32_t L = 0; L < 32; L++) addr_a[L] = (L & 15) * 32 + (L & 16), addr_b[L] = 512 + addr_a[L];
+
+    static _Alignas(256) TnInsn code[64];
+    memset(code, 0, sizeof code);
+    TnInsn *p = code;
+    tn_emit(&p, 0x0919 | 0 << 16, 0, 0);                                       // S2R R0, SR_LANEID
+    tn_emit(&p, 0x0824 | 1 << 16 | 0 << 24, 16, 0x078e00ffu);                  // IMAD R1, R0, 16, RZ
+    tn_emit(&p, 0x0824 | 3 << 16 | 0 << 24, 4, 0x078e00ffu);                   // IMAD R3, R0, 4, RZ
+    tn_emit(&p, 0x0ab9 | 4 << 16 | 0xff << 24, 0x10 << 6, 5 << 9);             // ULDC.64 UR4, c[0][0x10]
+    tn_emit(&p, 0x0981 | 4 << 16 | 1 << 24, 4, 0x081e8100u | 6 << 9);          // LDG.E.128 R4, [R1 + UR4]
+    tn_emit(&p, 0x0981 | 8 << 16 | 1 << 24, 4 | 512 << 8, 0x081e8100u | 6 << 9);    // LDG.E.128 R8, [R1 + UR4 + 512]
+    tn_emit(&p, 0x0981 | 32 << 16 | 3 << 24, 4 | 1024 << 8, 0x081e8100u | 4 << 9);  // LDG.E R32, [R3 + UR4 + 1024]
+    tn_emit(&p, 0x0981 | 33 << 16 | 3 << 24, 4 | 1152 << 8, 0x081e8100u | 4 << 9);  // LDG.E R33, [R3 + UR4 + 1152]
+    tn_emit(&p, 0x0388 | 1 << 24, 4, 6 << 9);                                  // STS.128 [R1], R4
+    tn_emit(&p, 0x0388 | 1 << 24, 8 | 512 << 8, 6 << 9);                       // STS.128 [R1 + 512], R8
+    tn_emit(&p, 0x0b1d, 0, 0);                                                 // BAR.SYNC 0
+    tn_emit(&p, 0x083b | 12 << 16 | 32 << 24, 0, 2 << 8);                      // LDSM.16.M88.4 R12, [R32]
+    tn_emit(&p, 0x083b | 16 << 16 | 33 << 24, 0, 2 << 8 | 1 << 14);            // LDSM.16.MT88.4 R16, [R33]
+    tn_emit(&p, 0x023c | 20 << 16 | 12 << 24, 16, 0xff | 8 << 8);              // HMMA R20, R12, R16, RZ
+    tn_emit(&p, 0x023c | 22 << 16 | 12 << 24, 18, 0xff | 8 << 8);              // HMMA R22, R12, R18, RZ
+    tn_emit(&p, 0x023c | 20 << 16 | 12 << 24, 16, 20 | 8 << 8);                // HMMA R20, R12, R16, R20
+    tn_emit(&p, 0x023c | 22 << 16 | 12 << 24, 18, 22 | 8 << 8);                // HMMA R22, R12, R18, R22
+    tn_emit(&p, 0x083b | 24 << 16 | 33 << 24, 0, 2 << 8 | 1 << 14);            // LDSM.16.MT88.4 R24, [R33]
+    tn_emit(&p, 0x023c | 28 << 16 | 12 << 24, 26, 0xff | 8 << 8);              // HMMA R28, R12, R26, RZ
+    tn_emit(&p, 0x023c | 30 << 16 | 12 << 24, 24, 0xff | 8 << 8);              // HMMA R30, R12, R24, RZ
+    tn_emit(&p, 0x0986 | 1 << 24, 20 | 2048 << 8, 0x0810a100u | 4 | 6 << 9);   // STG.E.128 [R1 + UR4 + 2048], R20
+    tn_emit(&p, 0x0986 | 1 << 24, 28 | 2560 << 8, 0x0810a100u | 4 | 6 << 9);   // STG.E.128 [R1 + UR4 + 2560], R28
+    tn_emit(&p, 0x094d, 0, 0x03800000u);                                       // EXIT
+    uint32_t code_end = (uint32_t)((p - code) * 16), code_size = 512;
+    static uint8_t ctl[0x100];
+    memset(ctl, 0, sizeof ctl);
+    const uint32_t magic = SM86_CONTROL_MAGIC, ctl_size = SM86_CONTROL_MIN, local[3] = {32, 1, 1}, shared = 1024;
+    memcpy(ctl, &magic, 4), memcpy(ctl + 0x30, &ctl_size, 4), memcpy(ctl + 0xd4, &ctl_size, 4);
+    memcpy(ctl + 0x38, &code_end, 4), memcpy(ctl + 0x40, &code_size, 4), memcpy(ctl + 0x44, &code_size, 4);
+    ctl[0x56] = 5, ctl[0xb2] = 1;
+    memcpy(ctl + 0x58, local, 12), memcpy(ctl + 0x64, &shared, 4);           // A and B in shared memory: 512 + 512 bytes
+    static prog_t prog;
+    memset(&prog, 0, sizeof prog);
+    prog.magic = NVN_PROG_MAGIC, prog.serial = 0x7101, prog.nstage = 1;
+    prog.sd[0].data = (uint64_t)(uintptr_t)code, prog.sd[0].control = ctl;
+
+    static _Alignas(8) uint8_t stream[1024];
+    uint8_t *q = stream;
+    q = put(q, OP_BEGIN, NULL, 0);
+    const p_bind_program bp = {&prog, 1 << 5};
+    q = put(q, OP_BIND_PROGRAM, &bp, sizeof bp);
+    const p_bind_buf sb = {5, 0, (uint64_t)(uintptr_t)buf, TN_BUF};
+    q = put(q, OP_BIND_SSBO, &sb, sizeof sb);
+    const p_dispatch dp = {1, 1, 1, 0};
+    q = put(q, OP_DISPATCH, &dp, sizeof dp);
+    const p_barrier bar = {0, 0};
+    q = put(q, OP_BARRIER, &bar, sizeof bar);
+    q = put(q, OP_END, NULL, 0);
+    uint64_t handle = (uint64_t)(uintptr_t)stream;
+    uint64_t f = b->submit(&handle, 1);
+    CHECK(b->fence_wait(f, 20000000000ull), "fence_wait of the tensor pairs dispatch timed out");
+
+    // Lane L (g = L >> 2, t = L & 3), register r of four: D[g + 8 (r & 1)][2t, 2t + 1] of the HMMA r >> 1 names. The
+    // models: rounding once per HMMA (pair 2: the product plus pair 1's rounded result, rounded), and a fused multiply-add
+    // rounded after each k as the emulation does (pair 2 continues from pair 1's sum).
+    int bad = 0, shown = 0, once = 0, steps = 0, max_ulp = 0;
+    for (uint32_t L = 0; L < 32; L++) {
+        uint32_t g = L >> 2, t = L & 3;
+        const uint16_t *got[2] = {(const uint16_t *)(buf + 2048 + L * 16), (const uint16_t *)(buf + 2560 + L * 16)};
+        for (int part = 0; part < 2; part++)
+            for (int r = 0; r < 4; r++)
+                for (int e = 0; e < 2; e++) {
+                    int row = (int)g + 8 * (r & 1), col = 8 * ((r >> 1) ^ part) + 2 * (int)t + e;   // pair 3: swapped
+                    uint16_t have = got[part][2 * r + e], one = tn_f2h((float)D[row][col]), step = 0;
+                    uint16_t want = part ? one : tn_f2h((float)(D[row][col] + tn_h2f(one)));
+                    for (int pass = 0; pass < (part ? 1 : 2); pass++)
+                        for (int k = 0; k < 16; k++)
+                            step = tn_f2h((float)((double)A[row][k] * B[k][col] + tn_h2f(step)));
+                    int ulp = abs((int)have - (int)want);
+                    once += ulp == 0, steps += have == step, max_ulp = ulp > max_ulp ? ulp : max_ulp;
+                    if (frac ? ulp > 2 : have != want) {
+                        bad++;
+                        if (shown++ < 12)
+                            printf("probe-tensor: pairs: lane %u %s register %d half %d is %g, expected %g\n", L,
+                                   part ? "pair 3" : "pair 2", r, e, tn_h2f(have), tn_h2f(want));
+                    }
+                }
+    }
+    for (uint32_t L = 0; bad && L < 32; L++) {
+        const uint32_t *w2 = (const uint32_t *)(buf + 2048 + L * 16), *w3 = (const uint32_t *)(buf + 2560 + L * 16);
+        printf("probe-tensor: pairs: lane %2u pair 2 %08x %08x %08x %08x pair 3 %08x %08x %08x %08x\n", L, w2[0], w2[1], w2[2],
+               w2[3], w3[0], w3[1], w3[2], w3[3]);
+    }
+    if (frac)
+        printf("probe-tensor: pairs, fractions: %d of 512 halves as rounded once per HMMA, %d as rounded after every step; "
+               "at most %d ulp from once\n", once, steps, max_ulp);
+    else
+        printf("probe-tensor: pairs: %d of 512 halves wrong (pair 2 after pair 1 in place, pair 3 with swapped halves)\n", bad);
+    b->pool_fini(&pool);
+    *n_bad = bad;
+    return 0;
+}
+
 int probe_tensor(void) {
     main_tid = GetCurrentThreadId();
     const GfxBackend *b = &gfx_vulkan_backend;
     uint64_t heap = 0;
     CHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");
     uint8_t *guest = (uint8_t *)(uintptr_t)heap;
-    int n_bad = -1;
+    int n_bad = -1, n_bad2 = -1;
     int bad = probe_tensor_run(b, guest, &n_bad);
+    for (int frac = 0; frac < 2 && !bad; frac++) bad = probe_tensor_pairs_run(b, guest, frac, &n_bad2), n_bad += n_bad2;
     b->finish();
     vk_pipeline_shutdown();
     vk_exec_draw_shutdown();

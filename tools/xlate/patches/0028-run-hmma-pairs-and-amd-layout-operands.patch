@@ -1,0 +1,329 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1161,7 +1161,12 @@
+         // OpCompositeInsert / OpCompositeExtract.
+         private static OperationResult GenerateMatrixMultiplyAdd(CodeGenContext context, AstOperation operation)
+         {
+-            if (operation.SourcesCount == 9)
++            if (operation.SourcesCount == 14)
++            {
++                return GenerateMatrixMultiplyAddPair(context, operation);
++            }
++
++            if (operation.SourcesCount == 9 || operation.SourcesCount == 10)
+             {
+                 return GenerateMatrixMultiplyAdd16(context, operation);
+             }
+@@ -1309,16 +1314,26 @@
+             SpvInstruction l7x4 = Shl(And(lane, 7), 2), q3 = Shr(lane, 3), h = Shr(lane, 4), t = And(lane, 3), g = Shr(lane, 2);
+             SpvInstruction upper = context.INotEqual(boolType, h, K(0));
+ 
+-            // A^T, the second operand, from HMMA's A registers.
+-            SpvInstruction[] sendA = Rotate(u32, [regs[0], regs[1], regs[2], regs[3]], t);
+-            SpvInstruction[] gotA = new SpvInstruction[4];
+-
+-            for (int j = 0; j < 4; j++)
+-            {
+-                gotA[j] = Shuffle(u32, sendA[(4 - j) & 3], Or(l7x4, And(Add(q3, j), 3)));
+-            }
+-
+-            SpvInstruction b = Matrix(typeB, Rotate(u32, gotA, And(Sub(4, q3), 3)));
++            // A^T, the second operand, from HMMA's A registers, or as they are when the plan has them in this layout
++            // already (source 9, the flags: 1, runtime/sm86_lower.c MMA_NAT_A; an LDSM.x4 loaded them so).
++            SpvInstruction b;
++
++            if (operation.SourcesCount == 10 && (((AstOperand)operation.GetSource(9)).Value & 1) != 0)
++            {
++                b = Matrix(typeB, [regs[0], regs[1], regs[2], regs[3]]);
++            }
++            else
++            {
++                SpvInstruction[] sendA = Rotate(u32, [regs[0], regs[1], regs[2], regs[3]], t);
++                SpvInstruction[] gotA = new SpvInstruction[4];
++
++                for (int j = 0; j < 4; j++)
++                {
++                    gotA[j] = Shuffle(u32, sendA[(4 - j) & 3], Or(l7x4, And(Add(q3, j), 3)));
++                }
++
++                b = Matrix(typeB, Rotate(u32, gotA, And(Sub(4, q3), 3)));
++            }
+ 
+             // B'', the first operand, from HMMA's B registers.
+             SpvInstruction[] gotB = new SpvInstruction[4];
+@@ -1373,6 +1388,178 @@
+             SpvInstruction result = context.CompositeConstruct(context.TypeVector(u32, 2), words[0], words[1]);
+ 
+             return new OperationResult(AggregateType.U32 | AggregateType.Vector2, result);
++        }
++
++        // The lowered pair of HMMA.16816.F16 that read the same A (runtime/sm86_lower.c hmma_plan; InstEmit.Mma, bits 49
++        // and 50): sources A 0-3, B1 4-5, B2 6-7, C1 8-9, C2 10-11, the lane id 12, the flags 13 (sm86_lower.c MMA_NAT_*:
++        // 1 A, 2 B, 4 C, 8 D in the AMD layout); results D1 0-1, D2 2-3. One 16x16x16 multiply, transposed as in
++        // GenerateMatrixMultiplyAdd16: R = P x Q + S with P = [B1 | B2]^T (MatrixA), Q = A^T (MatrixB) and S[n][m] =
++        // C_{n >> 3}[m][n & 7] (an f16 accumulator), so R[n][m] = D_{n >> 3}[m][n & 7]: both HMMAs' columns, no padding.
++        // In the measured order (lane l, h = l >> 4, element e: MatrixA row l % 16 at k = 8h + e, MatrixB column l % 16
++        // at k = 8h + e, the accumulator column l % 16 at rows 8h + e) word w of lane l (elements 2w, 2w + 1) of P, Q and
++        // S alike is register l >> 3 of a list of four, read in lane 4 (l & 7) + w: Q's list is A0-A3; P's is B1's first
++        // register, B2's first, B1's second, B2's second; S's is C1's two and C2's two. Gather moves such a list in four
++        // shuffles (as A^T in GenerateMatrixMultiplyAdd16: round j, lane l receives its word (j + (l >> 3)) & 3 and lane
++        // s sends its register (s - j) & 3). R goes back the inverse way: register i of lane 4c + w is R's word w of lane
++        // 8i + c (round j: lane L receives register (j + (L & 3)) & 3, lane s sends its word ((s >> 3) - j) & 3). An
++        // operand the plan keeps in the AMD layout is those words already, and a result it keeps so stays them (f16 pairs,
++        // as HMMA's registers hold them). C is in the accumulator.
++        private static OperationResult GenerateMatrixMultiplyAddPair(CodeGenContext context, AstOperation operation)
++        {
++            context.UseCooperativeMatrixKhr();
++
++            SpvInstruction u32 = context.TypeU32();
++            SpvInstruction f16 = context.TypeFloat(16);
++            SpvInstruction v2f16 = context.TypeVector(f16, 2);
++            SpvInstruction boolType = context.TypeBool();
++            SpvInstruction scope = context.Constant(u32, (int)Scope.Subgroup);
++            SpvInstruction c16 = context.Constant(u32, 16);
++            SpvInstruction typeA = context.TypeCooperativeMatrixKHR(f16, scope, c16, c16, context.Constant(u32, 0));
++            SpvInstruction typeB = context.TypeCooperativeMatrixKHR(f16, scope, c16, c16, context.Constant(u32, 1));
++            SpvInstruction typeC = context.TypeCooperativeMatrixKHR(f16, scope, c16, c16, context.Constant(u32, 2));
++
++            SpvInstruction K(int v) => context.Constant(u32, v);
++            SpvInstruction And(SpvInstruction x, int m) => context.BitwiseAnd(u32, x, K(m));
++            SpvInstruction Shr(SpvInstruction x, int n) => context.ShiftRightLogical(u32, x, K(n));
++            SpvInstruction Shl(SpvInstruction x, int n) => context.ShiftLeftLogical(u32, x, K(n));
++            SpvInstruction Or(SpvInstruction x, SpvInstruction y) => context.BitwiseOr(u32, x, y);
++            SpvInstruction Add(SpvInstruction x, int v) => context.IAdd(u32, x, K(v));
++            SpvInstruction Sub(int v, SpvInstruction x) => context.ISub(u32, K(v), x);
++            SpvInstruction Bit(SpvInstruction x, int m) => context.INotEqual(boolType, And(x, m), K(0));
++            SpvInstruction Shuffle(SpvInstruction value, SpvInstruction from) => context.GroupNonUniformShuffle(u32, scope, value, from);
++
++            // r[i] = v[(i + k) & 3] for the lane's k in 0-3: by 1 if k's bit 0 is set, then by 2 if its bit 1 is.
++            SpvInstruction[] Rotate(SpvInstruction[] v, SpvInstruction k)
++            {
++                SpvInstruction by1 = Bit(k, 1), by2 = Bit(k, 2);
++                SpvInstruction[] u = new SpvInstruction[4], r = new SpvInstruction[4];
++
++                for (int i = 0; i < 4; i++)
++                {
++                    u[i] = context.Select(u32, by1, v[(i + 1) & 3], v[i]);
++                }
++
++                for (int i = 0; i < 4; i++)
++                {
++                    r[i] = context.Select(u32, by2, u[(i + 2) & 3], u[i]);
++                }
++
++                return r;
++            }
++
++            // A cooperative matrix from four words per lane, each a pair of halves in element order.
++            SpvInstruction Matrix(SpvInstruction type, SpvInstruction[] words)
++            {
++                SpvInstruction m = context.Undef(type);
++
++                for (int w = 0; w < 4; w++)
++                {
++                    SpvInstruction pair = context.Bitcast(v2f16, words[w]);
++                    m = context.CompositeInsert(type, context.CompositeExtract(f16, pair, 0), m, 2 * w);
++                    m = context.CompositeInsert(type, context.CompositeExtract(f16, pair, 1), m, 2 * w + 1);
++                }
++
++                return m;
++            }
++
++            int flags = ((AstOperand)operation.GetSource(13)).Value;
++            SpvInstruction[] regs = new SpvInstruction[12];
++
++            for (int i = 0; i < 12; i++)
++            {
++                regs[i] = context.GetU32(operation.GetSource(i));
++            }
++
++            SpvInstruction lane = context.GetU32(operation.GetSource(12));
++            SpvInstruction l7x4 = Shl(And(lane, 7), 2), q3 = Shr(lane, 3), t = And(lane, 3), g = Shr(lane, 2);
++
++            // Lane l's word w is list[l >> 3] of lane 4 (l & 7) + w.
++            SpvInstruction[] Gather(SpvInstruction[] list)
++            {
++                SpvInstruction[] send = Rotate(list, t);
++                SpvInstruction[] got = new SpvInstruction[4];
++
++                for (int j = 0; j < 4; j++)
++                {
++                    got[j] = Shuffle(send[(4 - j) & 3], Or(l7x4, And(Add(q3, j), 3)));
++                }
++
++                return Rotate(got, And(Sub(4, q3), 3));
++            }
++
++            bool zeroC = true;
++
++            for (int i = 8; i < 12; i++)
++            {
++                zeroC &= operation.GetSource(i) is AstOperand { Type: OperandType.Constant, Value: 0 };
++            }
++
++            SpvInstruction[] q = (flags & 1) != 0 ? regs[0..4] : Gather(regs[0..4]);
++            SpvInstruction[] p = (flags & 2) != 0 ? regs[4..8] : Gather([regs[4], regs[6], regs[5], regs[7]]);
++            // Flag 16 (sm86_lower.c MMA_ACC16): an f16 accumulator with C inside, which RDNA 4 rounds within an ulp of once
++            // (oot.exe --probe-tensor). Without it the accumulator is f32: C goes in converted, the one rounding to f16 is at
++            // the end, as the tensor cores round once per HMMA.
++            bool acc16 = (flags & 16) != 0;
++            SpvInstruction f32 = context.TypeFP32(), v2f32 = context.TypeVector(f32, 2);
++            SpvInstruction typeAcc = acc16 ? typeC : context.TypeCooperativeMatrixKHR(f32, scope, c16, c16, context.Constant(u32, 2));
++
++            SpvInstruction Accumulator(SpvInstruction[] cw)
++            {
++                if (acc16)
++                {
++                    return Matrix(typeC, cw);
++                }
++
++                SpvInstruction m = context.Undef(typeAcc);
++
++                for (int w = 0; w < 4; w++)
++                {
++                    SpvInstruction pair = context.FConvert(v2f32, context.Bitcast(v2f16, cw[w]));
++                    m = context.CompositeInsert(typeAcc, context.CompositeExtract(f32, pair, 0), m, 2 * w);
++                    m = context.CompositeInsert(typeAcc, context.CompositeExtract(f32, pair, 1), m, 2 * w + 1);
++                }
++
++                return m;
++            }
++
++            SpvInstruction s = zeroC ? context.ConstantComposite(typeAcc, acc16 ? context.Constant(f16, 0) : context.Constant(f32, 0f)) :
++                               Accumulator((flags & 4) != 0 ? regs[8..12] : Gather(regs[8..12]));
++            SpvInstruction d = context.CooperativeMatrixMulAddKHR(typeAcc, Matrix(typeA, p), Matrix(typeB, q), s);
++
++            SpvInstruction[] words = new SpvInstruction[4];
++
++            for (int w = 0; w < 4; w++)
++            {
++                if (acc16)
++                {
++                    SpvInstruction lo = context.CompositeExtract(f16, d, 2 * w);
++                    SpvInstruction hi = context.CompositeExtract(f16, d, 2 * w + 1);
++                    words[w] = context.Bitcast(u32, context.CompositeConstruct(v2f16, lo, hi));
++                }
++                else
++                {
++                    SpvInstruction lo = context.CompositeExtract(f32, d, 2 * w);
++                    SpvInstruction hi = context.CompositeExtract(f32, d, 2 * w + 1);
++                    words[w] = context.Bitcast(u32, context.FConvert(v2f16, context.CompositeConstruct(v2f32, lo, hi)));
++                }
++            }
++
++            if ((flags & 8) == 0)
++            {
++                SpvInstruction[] send = Rotate(words, q3);
++                SpvInstruction[] got = new SpvInstruction[4];
++
++                for (int j = 0; j < 4; j++)
++                {
++                    got[j] = Shuffle(send[(4 - j) & 3], Or(Shl(And(Add(t, j), 3), 3), g));
++                }
++
++                words = Rotate(got, And(Sub(4, t), 3));
++            }
++
++            SpvInstruction result = context.CompositeConstruct(context.TypeVector(u32, 4), words[0], words[1], words[2], words[3]);
++
++            return new OperationResult(AggregateType.U32 | AggregateType.Vector4, result);
+         }
+ 
+         private static OperationResult GenerateShuffle(CodeGenContext context, AstOperation operation)
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitWarp.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitWarp.cs
+@@ -52,14 +52,67 @@
+         {
+             ulong op = context.CurrOp.RawOpCode;
+             int rd = (int)(op & 0xff), ra = (int)((op >> 8) & 0xff), rb = (int)((op >> 20) & 0xff), rc = (int)((op >> 39) & 0xff);
++            int flags = (int)((op >> 28) & 0x1f);
++
++            // Bits 49 and 50 (runtime/sm86_lower.c hmma_plan, tensor mode 2): two HMMAs that share A, as two markers in a
++            // row. The first (bit 49) is held back; the second (bit 50) runs both as one operation of four results
++            // (GenerateMatrixMultiplyAddPair): sources A 0-3, the first's B 4-5, the second's B 6-7, the first's C 8-9,
++            // the second's C 10-11, the lane id 12, the flags 13 (bits 28-32: sm86_lower.c MMA_NAT_*, MMA_ACC16).
++            if (((op >> 49) & 1) != 0)
++            {
++                context.MmaPairFirst = op;
++                return;
++            }
++
++            if (((op >> 50) & 1) != 0)
++            {
++                ulong first = context.MmaPairFirst;
++                int rd0 = (int)(first & 0xff), rb0 = (int)((first >> 20) & 0xff), rc0 = (int)((first >> 39) & 0xff);
++                Operand[] pair = new Operand[14];
++
++                context.MmaPairFirst = 0;
++
++                for (int i = 0; i < 4; i++)
++                {
++                    pair[i] = GetSrcReg(context, ra + i);
++                }
++
++                for (int i = 0; i < 2; i++)
++                {
++                    pair[4 + i] = GetSrcReg(context, rb0 + i);
++                    pair[6 + i] = GetSrcReg(context, rb + i);
++                    pair[8 + i] = GetSrcReg(context, rc0 == RegisterConsts.RegisterZeroIndex ? rc0 : rc0 + i);
++                    pair[10 + i] = GetSrcReg(context, rc == RegisterConsts.RegisterZeroIndex ? rc : rc + i);
++                }
++
++                pair[12] = context.Load(StorageKind.Input, IoVariable.SubgroupLaneId);
++                pair[13] = Const(flags);
++
++                Operand[] d = [Local(), Local(), Local(), Local()];
++
++                context.Add(new Operation(Instruction.MatrixMultiplyAdd, 0xf, d, pair));
++
++                context.Copy(GetDest(rd0), d[0]);
++                context.Copy(GetDest(rd0 + 1), d[1]);
++                context.Copy(GetDest(rd), d[2]);
++                context.Copy(GetDest(rd + 1), d[3]);
++
++                return;
++            }
+ 
+             // Bit 48 (ocarina-of-time-recomp runtime/sm86_lower.c lower_hmma, tensor mode 2): the device has 16x16x16
+-            // matrices only, and the fragments move between lanes (GenerateMatrixMultiplyAdd16), which needs the lane id.
+-            Operand[] sources = new Operand[((op >> 48) & 1) != 0 ? 9 : 8];
+-
+-            if (sources.Length == 9)
++            // matrices only, and the fragments move between lanes (GenerateMatrixMultiplyAdd16), which needs the lane id;
++            // with flags (A already in the AMD layout) a tenth source carries them.
++            Operand[] sources = new Operand[((op >> 48) & 1) != 0 ? (flags != 0 ? 10 : 9) : 8];
++
++            if (sources.Length >= 9)
+             {
+                 sources[8] = context.Load(StorageKind.Input, IoVariable.SubgroupLaneId);
++            }
++
++            if (sources.Length == 10)
++            {
++                sources[9] = Const(flags);
+             }
+ 
+             for (int i = 0; i < 4; i++)
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
+@@ -114,7 +114,7 @@
+             Add(Instruction.ShiftLeft,                AggregateType.S32,    AggregateType.S32,     AggregateType.S32);
+             Add(Instruction.ShiftRightS32,            AggregateType.S32,    AggregateType.S32,     AggregateType.S32);
+             Add(Instruction.ShiftRightU32,            AggregateType.U32,    AggregateType.U32,     AggregateType.S32);
+-            Add(Instruction.MatrixMultiplyAdd,        AggregateType.U32,    AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32,     AggregateType.U32);
++            Add(Instruction.MatrixMultiplyAdd,        AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32,    AggregateType.U32);
+             Add(Instruction.SetMeshOutputs,           AggregateType.Void,   AggregateType.U32,     AggregateType.U32);
+             Add(Instruction.EmitMeshTasks,            AggregateType.Void,   AggregateType.U32);
+             Add(Instruction.MeshStoreVertex,          AggregateType.Void,   AggregateType.S32,     AggregateType.U32,     AggregateType.U32);
+--- a/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
+@@ -21,6 +21,9 @@
+ 
+         public Block CurrBlock { get; set; }
+         public InstOp CurrOp { get; set; }
++
++        // The first marker of an HMMA pair, held until the second (InstEmit.Mma; ocarina-of-time-recomp).
++        public ulong MmaPairFirst { get; set; }
+ 
+         public int OperationsCount => _operations.Count;
+ 

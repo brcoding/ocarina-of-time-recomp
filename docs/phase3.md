@@ -436,9 +436,126 @@ after 14.5 minutes on an RX 9060 XT). They now run on the RDNA 4 matrix cores, a
   builds a dispatch's pipeline and records nothing, so `--probe-cs <dir>` (bindings.txt `dispatch 1 1 1`) times a
   kernel's cold build without running it; `kernel.py --tensor-mode 2`, `run.py --exe`, `xlate_patch.py --build`.
 
-Open, for AMD: the per-HMMA chain (two HMMAs sharing A in one multiply, or an f16 accumulator with C inside, whose D
-comes back in two shuffles); compute pipelines that build under `P.lock` on the replay thread (issue #9). (The 48 KB
-of shared memory every compute program got is fixed: the status above.)
+Open, for AMD: the per-HMMA chain (done 2026-11-09, the next section); compute pipelines that build under `P.lock` on
+the replay thread (issue #9). (The 48 KB of shared memory every compute program got is fixed: the status above.)
+
+## Status (2026-11-09): AMD's HMMAs in pairs, operands kept in the AMD layout
+
+On the RX 9070 XT, on top of the per-kernel shared memory of the status above, the title's upscaler now takes 1.8 ms
+of GPU time a frame instead of 6.0 and the frame 5.2 ms instead of 9.4; without that change, on main, 4.2 ms instead
+of 12.3 (52 fps GPU-bound, 30 under upstream's adaptive pacer), and the title holds 60 fps. The HMMA kernels build cold
+in about 9 s instead of 36-52 s. Each comparison is one build, `OOT_TENSOR_NATIVE` switching the plan off. Kernels are
+named by their input ids from before the shared-memory change, which changed every id (the status above lists both).
+
+- **Where the time went.** 63f42c62's AMD code (`OOT_CS_INFO=isa`) was 46,000 lines: 576 WMMAs, 5,288 `ds_bpermute`,
+  16,677 `v_cndmask` and 4,500 f16/f32 conversions, about 80 instructions of data movement per HMMA, on each wave's
+  serial chain. The kernel's shape makes most of it redundant: groups of four HMMAs read the same A (an LDSM.x4 just
+  before), each accumulates in place over a chain of 18 groups, and its 72 B fragments, loaded once by LDSM.x4.trans
+  before the loop, stay in registers for all of it. Every HMMA converted A, B, C and D again, undoing the previous
+  one's work.
+- **Pairs** (`sm86_lower.c hmma_plan`, translator patch 0028 `GenerateMatrixMultiplyAddPair`). Two HMMAs of a block
+  that read the same A, where the second reads nothing the first writes and nothing between them touches the
+  second's operands, run as one 16x16x16 multiply, transposed as before: R = P x Q + S with P = [B1 | B2]^T, Q = A^T,
+  S[n][m] = C_{n/8}[m][n%8], so R[n][m] = D_{n/8}[m][n%8], both results side by side and no padding. All four
+  operands move the same way: word w of lane l is register l >> 3 of a list of four (A0-A3; B1 and B2's registers
+  interleaved; C1's and C2's), read in lane 4 (l & 7) + w, four shuffles and two rotations each; D the inverse.
+  The lowering emits two markers in a row (bit 49 on the first, which the translator holds back, bit 50 on the
+  second); bits 28-32 carry the flags below.
+- **Operands kept in the AMD layout.** A register set is a web of definitions and uses: a pair's D read back as the
+  C of the next pair of its chain; an A that an LDSM.x4 loaded, which in the AMD layout is the 16 bytes at the lane's
+  own row address (one LDS.128 instead of four shuffles and four loads); a B pair that an LDSM.x4.trans loaded, which
+  is a lane's column gathered from eight row addresses (eight shuffles and eight 16-bit loads, what the plain trans
+  load costs). A web stays in the AMD layout only when, along every path of the control flow, every instruction that
+  reads its registers is a use expecting that layout and every definition reaching those uses produces it (a forward
+  search from each definition, a backward one from each use, union-find over both); any other reader, a partial or
+  predicated write or a use reachable from elsewhere keeps it in HMMA's layout, and its markers convert as before.
+  `plan_view` gives HMMA, LDSM and PLOP3 their exact registers: `insn_regs` counts bits 64-71 as a register of every
+  ALU form, which made every LDSM read R0 and every PLOP3 a B register, and would have blocked most webs. In liveness
+  mode the second HMMA's result is kept live from the first on, so no scratch lands on it.
+- **Coverage** (`SM86_PLAN=1` with the lowering tool; pairs, singles, then how many take A, B and C in the AMD
+  layout and leave D in it): 63f42c62 288 pairs, A 272, B 280, C 272, D 272 (16 chains of 18 pairs: the first
+  starts from zero, the last converts); df040d44 232 pairs, A 231, B 203, C and D 202; 5aeb2e11 335 pairs and 98
+  single, A 341, B 288, C and D 239; df00b2bd 72 pairs, A 72, B 68, C and D 70; c5379e8e 50 pairs and 8 single, A 50,
+  B 18, C and D 38; 197ec50b 22 and 2, A 11, B 10, C and D 5. 406ecfce and b62d9f75, which have no LDSM, pair and
+  chain only.
+- **Rounding.** `--probe-tensor` has a second kernel now: LDSM.x4 A, LDSM.x4.trans B, a pair into zero accumulators,
+  a pair adding to them in place, a pair with B's halves the other way round, on integers (exact) and on values whose
+  products need 13 fraction bits. With an f32 accumulator (C converted in, one rounding to f16 at the end, the
+  default) all 512 halves are rounded once per HMMA, as with the old path; with an f16 accumulator (C inside, no
+  conversions, `OOT_TENSOR_NATIVE=3h`) RDNA 4 matches rounding once on 335 of 512 and is never more than one ulp off
+  (the emulation: 256, also within one ulp).
+- **Measured** (title, `OOT_CS_TIME=1` and `--trace perf`, 60 s, the last 100 frames; one build):
+
+  | `OOT_TENSOR_NATIVE` | the eleven kernels, ms a frame | 63f42c62, ms each (x2) | GPU, ms a frame | fps |
+  |---|---|---|---|---|
+  | 0: one HMMA per marker (the old mapping) | 12.3 | 1.99 | 15.9 | 52 |
+  | 1: pairs, every operand converted | 8.84 | 1.51 | 12.4 | 60 |
+  | 1h: pairs, f16 accumulator with C inside | 7.24 | 1.10 | 10.7 | 60 |
+  | 2: pairs and accumulator chains | 5.39 | 0.83 | 8.85 | 60 |
+  | 3: also A and B from LDSM (default) | 4.20 | 0.48 | 7.7 | 60 |
+  | 3h: as 3, f16 accumulators | 3.39 | 0.20 | 6.96 | 60 |
+
+  Levels 0 and 3 ran with `OOT_PRESENT_INTERVAL=0` (the game's 60 Hz interval, no adaptive 30 fps); the others never
+  miss 60 Hz, so the pacer leaves them there. Paced, level 0 holds 30 fps and its kernels take 14.1 ms, as the GPU
+  clocks down between frames; a build of 027dc78, before the pacer, measured 12.4 ms and 51 fps. Of the hand-off's
+  candidates, pairs alone already reach the cap, an f16 accumulator with C inside saves 1.6 ms more, keeping the
+  accumulators in the AMD layout instead 3.5 ms, and taking A and B from LDSM another 1.3 ms. 197ec50b (0.88 ms, 46
+  HMMAs, 80x180 groups) and dfc7a190 (0.42 ms twice) are the largest now. The f32 accumulator costs 63f42c62 2.4
+  times the f16 one: per chain of 36 pairs its code is 705 lines with 552 conversions, against 95 lines (2.6
+  instructions a WMMA).
+- **On the shared-memory change** (972cdb1 with this one, title, `--alone`, `OOT_PRESENT_INTERVAL=0`, 75 s, the
+  last 100 frames; `build/v131072-combo`, which also has PR #19's pacer, off here): GPU time per dispatch, plan off and
+  on, the new ids in brackets.
+
+  | Kernel | Plan off | Plan on |
+  |---|---|---|
+  | 63f42c62 [ac616599] (x2 per frame) | 1.127 ms | 0.262 ms |
+  | df00b2bd [410807fe] (x2) | 0.740 ms | 0.083 ms |
+  | c5379e8e [789500e3] | 0.657 ms | 0.080 ms |
+  | 197ec50b [e4cfcc02] | 0.540 ms | 0.443 ms |
+  | d22b0e01 [12658545] | 0.220 ms | 0.118 ms |
+  | 5aeb2e11 [43c01576] | 0.196 ms | 0.103 ms |
+  | dfc7a190 [6f1847f8] (x2) | 0.183 ms | 0.095 ms |
+  | df040d44 [fc1f969e] | 0.125 ms | 0.037 ms |
+  | baea7b2f [0ea2765d] | 0.107 ms | 0.054 ms |
+  | 5d415995 [c5b329fe] | 0.038 ms | 0.041 ms |
+
+  The eleven kernels 5.99 ms a frame and 1.77 ms, the GPU 9.41 ms and 5.17 ms (`OOT_TRACE=perf`), 60 fps both. df00b2bd,
+  which the shared-memory change left as it was (its driver register choice spilled more), drops ninefold. Cold
+  builds in the same runs (`OOT_CS_INFO=1`, which gives the pipelines flags of their own): 9.0 s for the HMMA kernels
+  with the plan, 52.1 s without (two of them built twice).
+- **Size and build time.** SPIR-V words, old and plan: 63f42c62 884k to 310k, 5aeb2e11 1.31M to 704k, df040d44 770k to
+  283k, 406ecfce 283k to 183k, df00b2bd 275k to 123k, c5379e8e 190k to 95k, d22b0e01 166k to 103k. Cold builds
+  (`OOT_CS_BUILD_ONLY=1` with `--probe-cs`): 63f42c62 7.9 s to 2.3 s, 5aeb2e11 7.8 to 3.3, c5379e8e 14.0 to 0.38 (it
+  no longer spills), df040d44 2.6 to 0.65, df00b2bd 1.8 to 0.94; the title's ten HMMA kernels 35.8 s to 8.7 s (7.3 s
+  with f16 accumulators). 63f42c62's code is 11,300 lines (6,500 with f16): 288 WMMAs, 176 `ds_bpermute`, about 710
+  `v_cndmask`; it still uses all 256 VGPRs and spills 608 bytes, all of it in the prologue that loads the weights.
+- **Checked.** `--probe-tensor` (both kernels, levels 0-3 and 3h, and emulated), `--probe-coopmat`, `--probe-vkmem`
+  pass. NVIDIA's mode 1 and mode 2 with the plan off lower and translate all 13 tensor kernels byte for byte as main
+  does (the lowering tool and a translator of patches 0001-0027). The title's screenshots at 30 s score as pictures
+  (noise 0.45-0.47: `build/logs/hm-plan-30.png`, `hm-plan16-30.png`, `hm-noplan-30.png`). Runs show the same picture
+  only at the same frame rate and present: two default runs at 30 s match at 36.2 dB, their background identical to
+  the pixel (the logo's fade differs). Of eight full-size presents around 30 s per run (`OOT_SHOTS=w29.4-30.0:0.016
+  OOT_SHOTS_FULL=1`), the f16 accumulator's best match with the default is 46.5 dB, a mean difference of 0.38 of 255,
+  at most 11. The plan off reaches other presents (51 fps unpaced), so both ran at a fixed 30 fps
+  (`OOT_PRESENT_INTERVAL=2`, `build/logs/hm-series30-{3,0}`): their matching presents are 73.0 dB apart, a mean
+  difference of 0.003 of 255 and at most 2, the picture of the old mapping.
+  On the shared-memory change with PR #19's pacer (`build/v131072-combo`): the three probes pass; the title at 30 s
+  scores 0.52 (`build/logs/combo-plan-30.png`, the grass loop); plan on and off at a fixed 30 fps match at 72.9 dB, at
+  most 3 of 255 (`combo-series30-{3,0}`). The level route (`--replay build/logs/a-spam.txt --skip-movies`, 200 s,
+  warm, a shot every 2 s from 120 s): with the pacer 30 fps and the scene drawn in 41 shots of 41
+  (`combo-level-paced`, the same dark spot as `lds2-level30-*`); unpaced (`OOT_PRESENT_INTERVAL=0`) 50 fps, bound by
+  the CPU, 11.6 ms of GPU a frame and about 2.6 ms of compute in 60 kernels, none of them HMMA kernels
+  (`combo-level-unpaced`).
+- **Not built: a re-layout through shared memory** (stores, a barrier, OpCooperativeMatrixLoad). Loading A and B in
+  the AMD layout from the program's own LDSM tiles moves no data the program does not already load, needs no shared
+  memory beyond what the kernel declares, and leaves no store-load round trip on the chain.
+- `OOT_TENSOR_NATIVE` (diagnostic, mixed into the cache key): 0 off, 1 pairs, 2 and chains, 3 everything (default),
+  an `h` for f16 accumulators. KEY_VERSION 31.
+
+Open: the f16 accumulator saves 0.7 ms a frame (the kernels 18%) but rounds within an ulp of once rather than once;
+native A loads come out as four `ds_load_b32` (the translator's LDS.128 is four word loads the driver does not merge);
+63f42c62's prologue spills; 197ec50b, half of whose pairs still convert A and B, is the largest kernel now.
 
 ## Status (2026-11-08, evening): the flickering level and the occlusion counts
 

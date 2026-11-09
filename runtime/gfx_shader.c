@@ -56,11 +56,12 @@
 #define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 31                                      // in every cache key; bump when the key layout or the use of the
+#define KEY_VERSION 32                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids;
                                                            // 5: NVN2 programs; 30: HMMA on 16x16x16 matrices, sm86_lower.c
                                                            // marker bit 48; 31: compute shared memory as the control
-                                                           // declares it); translator changes are covered by its identity
+                                                           // declares it; 32: HMMA pairs, hmma_plan); translator
+                                                           // changes are covered by its identity
 #define SHARED_MAX 0xc000u                                 // compute shared memory: Maxwell's and Vulkan's common limit
 #define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
                                                            // or the program hash changes (drops every stored input;
@@ -354,11 +355,14 @@ void gfx_shader_set_tensor(int mode) {
     paths();
     sm86_lower_tensor_cores = mode;
     if (!mode) return;
-    uint8_t buf[32 + 16];
+    // Mode 2 also by the plan's level (sm86_lower.c hmma_plan, OOT_TENSOR_NATIVE): another level lowers otherwise.
+    const char *native = mode == 2 ? getenv("OOT_TENSOR_NATIVE") : NULL;
+    uint8_t buf[32 + 48];
     memcpy(buf, xlate_id, 32);
-    memcpy(buf + 32, mode == 2 ? "TKTC tensor=2" : "TKTC tensor=1", 13);
-    rt_sha256(buf, 32 + 13, xlate_id);
-    rt_log("gfx_shader: HMMA runs on cooperative matrices%s: own shader cache keys", mode == 2 ? " (16x16x16 mapping)" : "");
+    int n = snprintf((char *)buf + 32, 48, "TKTC tensor=%d%s%.8s", mode, native && *native ? " native=" : "", native ? native : "");
+    rt_sha256(buf, 32 + (size_t)n, xlate_id);
+    rt_log("gfx_shader: HMMA runs on cooperative matrices%s: own shader cache keys%s%s", mode == 2 ? " (16x16x16 mapping)" : "",
+           native && *native ? ", OOT_TENSOR_NATIVE=" : "", native && *native ? native : "");
 }
 
 // ---- the translator children
