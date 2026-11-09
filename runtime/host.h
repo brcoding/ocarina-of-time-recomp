@@ -65,7 +65,8 @@ extern void (*perf_gpu_stats)(PerfGpu *out);
 // The performance overlay (perfmon.c): mode 0 off, 1 fps, 2 full. While it is on, perf_present hands every frame to
 // perfmon_frame; full also takes the event counts (perf_count) and the GPU timestamps as OOT_TRACE=perf does.
 void perf_set_overlay(int mode);
-int perf_gpu_timing(void);                      // GPU timestamps wanted: OOT_TRACE=perf or the full overlay
+int perf_gpu_timing(void);                      // GPU timestamps wanted: OOT_TRACE=perf, the full overlay or the pacer
+void perf_gpu_timing_want(void);                // from now on (nvn_api_obj.c ap_init: the adaptive present interval)
 void perf_gpu_busy(uint64_t ns);                // GPU busy time of a timed submission part (vk_sync.c, any thread)
 uint64_t perf_gpu_busy_total(void);             // its running total (the overlay's GPU time per frame)
 #define RT_RESULT(module, desc) ((uint32_t)(module) | ((uint32_t)(desc) << 9))

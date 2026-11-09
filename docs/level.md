@@ -240,3 +240,33 @@ After each change that alters what a shader computes: the `verify-shader-change`
     the uniform snapshot (`OOT_UBO_SNAPSHOT=0`: fewer NaN frames, not none), Ryujinx's ignored `.FMZ` (our lowering
     refuses SM86 `.DNZ` FFMA and FMUL, so no lowered fp32 multiply needs it).
   - Left: the white spikes from Link while he moves (stretched triangles), at 30 fps too.
+- 2026-11-09 (RX 9070 XT): that first pacer rule left the black frames on this GPU. On the level route (warm caches,
+  `run.py --alone`, `OOT_SHOTS=w120-200:2`) about half the shots were black (19 of 41 on main 17b8c4b, run-82; 22 of
+  51 with the shared-memory commit), at an uneven 46-49 fps. It went to 30 only after 8 frames in a row over 18 ms of
+  CPU work and back once that work averaged under 13 ms. At 60 the level's frames take 14-38 ms, about 20 on average
+  (perf line: GPU 12.3 ms, and other threads wait 9.6 ms of each frame for GPU fences, the game's own once-a-frame
+  sync), but seldom 8 in a row over 18 ms of work; at 30 the work is 10-12 ms, so it went back to 60 every few seconds
+  and stayed there. The title without the shared-memory commit flipped the same way (CPU work 2 ms, GPU 18.3 ms).
+  - New rule (`nvn_api_obj.c`, adaptive interval), over a sliding window of 120 frames. At 60, a frame's cost is the
+    time since the previous present less the pacer's own sleep in the acquire (GPU fence waits count); 12 of the
+    window over 17.5 ms switch to 30. At 30 the pacer predicts the cost at 60 as CPU work (less every acquire wait)
+    plus GPU time (the timestamps of `OOT_TRACE=perf`, now also taken for the pacer, averaged over 8 presents), which
+    assumes no overlap, as the fence waits above show; back to 60 when a full window has at most 6 frames predicted
+    over 16 ms and 30 was held 5 s. A return that misses again within 10 s doubles the next hold (up to 320 s).
+    `OOT_TRACE=perf` logs both measures every 600 presents, in every mode (`nvn: pacing at <n> ticks: ...`, with
+    medians and percentiles).
+  - Level, main 17b8c4b + the rule (run-88): 0 black of 41 shots, a steady 30.0 fps (1% low 27.8) from the level's
+    start to the end; at 30 every frame is predicted over the line (CPU work 9.8-10.2 + GPU 12.6 ms on average). The
+    only switches are in the start-up (to 30 while loading, back on the title, to 30 again within 10 s: hold 10 s).
+  - Title, with the shared-memory commit (run-90): to 30 while loading, back to 60 after 6 s (CPU work 3.7 + GPU
+    10.4 ms predicted at 30; the GPU reads about 10% slower at 30 than at 60), then 60 to the end: 59.2 fps over the
+    second minute (1% low 56.3; six frames of about 160 ms where the title loop hands over to the cinematic, under the
+    12 that switch). At 60: CPU work 2.2 + GPU 9.4 ms, at most 1% of frames predicted over 15 ms.
+  - Title, main 17b8c4b + the rule (run-92): 30 fps (29.9 over the second minute, 1% low 29.4; predicted median
+    20.4 ms, 5th percentile 20.0). One return to 60, where the title loop hands over to the cinematic (4 s of light
+    frames, GPU 1.4 ms): it missed again after 35 frames and held 30 from then on, the hold doubled to 10 s. The first
+    rule flipped this title every few seconds (run-65).
+  - Level, with the shared-memory commit (run-94): 0 black of 41 shots, 30.0 fps from the level's start to the end
+    (1% low 26.5-27.4; predicted CPU work 10.1-10.6 + GPU 11.5 ms, 5th percentile 19.8 ms). Runs 88-94 were taken with
+    `--trace perf` (as run-82), whose line every 600 presents is where the numbers above come from; run-88 had the
+    window's first version (fit line 15 ms), the others the committed one.

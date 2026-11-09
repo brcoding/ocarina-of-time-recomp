@@ -340,7 +340,14 @@ void perf_set_overlay(int mode) {
     __atomic_store_n(&perf_on, perf_base || mode == 2, __ATOMIC_RELAXED);
 }
 
-int perf_gpu_timing(void) { return (rt_trace & RT_TRACE_PERF) || __atomic_load_n(&overlay, __ATOMIC_RELAXED) == 2; }
+static int gpu_wanted;   // perf_gpu_timing_want: the adaptive present pacer predicts frames from the GPU time
+
+void perf_gpu_timing_want(void) { __atomic_store_n(&gpu_wanted, 1, __ATOMIC_RELAXED); }
+
+int perf_gpu_timing(void) {
+    return (rt_trace & RT_TRACE_PERF) || __atomic_load_n(&overlay, __ATOMIC_RELAXED) == 2 ||
+           __atomic_load_n(&gpu_wanted, __ATOMIC_RELAXED);
+}
 
 static volatile LONG64 gpu_busy_total;
 

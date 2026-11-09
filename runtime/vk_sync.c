@@ -114,10 +114,11 @@ static DWORD WINAPI ft_watch_main(void *arg) {
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
 
-// ---- GPU time (OOT_TRACE=perf): each submission part (vk_sync_split) writes a timestamp when it starts and when it
-// ends, into a ring of query pairs. The completion thread reads a pair once the part's value is reached and adds the
-// part's interval to the busy time, counting overlap with the previous part once. Off (one log line) when the queue
-// family has no timestamp bits or the period is 0. Upload batches (vk_memory.c) are not timed.
+// ---- GPU time (OOT_TRACE=perf, the full overlay, and the adaptive present interval: nvn_api_obj.c ap_present): each
+// submission part (vk_sync_split) writes a timestamp when it starts and when it ends, into a ring of query pairs. The
+// completion thread reads a pair once the part's value is reached and adds the part's interval to the busy time,
+// counting overlap with the previous part once. Off (one log line) when the queue family has no timestamp bits or the
+// period is 0. Upload batches (vk_memory.c) are not timed.
 #define TS_PAIRS 1024
 static VkQueryPool ts_pool;
 static int ts_state;                       // 0 not set up, 1 on, -1 off
@@ -129,7 +130,8 @@ static int ts_cur = -1;                    // the pair of the part being recorde
 static uint64_t ts_last_end;               // completion thread: end of the latest part read (ticks)
 static volatile LONG64 ts_busy_ns, ts_parts, ts_missed;
 
-// On the first submission that wants timing (perf_gpu_timing: OOT_TRACE=perf or the full performance overlay).
+// On the first submission that wants timing (perf_gpu_timing: OOT_TRACE=perf, the full performance overlay or the
+// adaptive present interval).
 static void ts_setup(VkCtx *c) {
     ts_state = -1;
     uint32_t nq = 0;
