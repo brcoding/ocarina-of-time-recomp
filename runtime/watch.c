@@ -7,6 +7,8 @@
 // stores and the runtime's own copies both hit it. <len> is 1, 2, 4 or 8 (default 8), the address aligned to it;
 // ":rw" traps reads too (the CPU reading back what the GPU wrote).
 // OOT_WATCH_FROM=<frame> arms it from that frame on (default 0). At most 256 writes are logged; later ones run on.
+// OOT_WATCH_REGS=1 adds the host's general registers at each trap: the lifted code keeps guest registers in them, so
+// the pointer a stored value was loaded from (the source of a record field) shows up there.
 //
 // OOT_WATCH_POLL=<addr>[,<addr>...] (at most 4, from OOT_WATCH_FROM): the watch thread, which arms no trap on itself,
 // reads each u64 every millisecond and logs every change it sees, at most 256: for values the GPU writes, which
@@ -40,6 +42,7 @@ static struct {
     int np;
     uint64_t poll[4], last[4];
     uint64_t dump_addr, dump_len, dump_frame;
+    int regs;
 } W;
 
 static LONG CALLBACK watch_handler(EXCEPTION_POINTERS *ep) {
@@ -68,6 +71,14 @@ static LONG CALLBACK watch_handler(EXCEPTION_POINTERS *ep) {
                    (unsigned long long)v,
                    in_exe ? "exe+" : "host ", (unsigned long long)(in_exe ? rip - W.exe_lo : rip), GetCurrentThreadId(),
                    k ? ret : " (no exe address)");
+            if (W.regs)
+                rt_log("watch:   rax %llx rbx %llx rcx %llx rdx %llx rsi %llx rdi %llx rbp %llx r8 %llx r9 %llx r10 %llx "
+                       "r11 %llx r12 %llx r13 %llx r14 %llx r15 %llx",
+                       (unsigned long long)cx->Rax, (unsigned long long)cx->Rbx, (unsigned long long)cx->Rcx,
+                       (unsigned long long)cx->Rdx, (unsigned long long)cx->Rsi, (unsigned long long)cx->Rdi,
+                       (unsigned long long)cx->Rbp, (unsigned long long)cx->R8, (unsigned long long)cx->R9,
+                       (unsigned long long)cx->R10, (unsigned long long)cx->R11, (unsigned long long)cx->R12,
+                       (unsigned long long)cx->R13, (unsigned long long)cx->R14, (unsigned long long)cx->R15);
         }
     }
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -182,6 +193,7 @@ void watch_start(void) {
     if (!W.n && !W.np && !W.dump_len) return;
     const char *f = cfg_get("OOT_WATCH_FROM");
     W.from = f && *f ? strtoull(f, NULL, 10) : 0;
+    W.regs = cfg_get("OOT_WATCH_REGS") && *cfg_get("OOT_WATCH_REGS") == '1';
     HMODULE self = GetModuleHandleW(NULL);
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((uint8_t *)self + ((IMAGE_DOS_HEADER *)self)->e_lfanew);
     W.exe_lo = (uintptr_t)self, W.exe_hi = (uintptr_t)self + nt->OptionalHeader.SizeOfImage;

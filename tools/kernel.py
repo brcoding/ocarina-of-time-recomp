@@ -7,6 +7,7 @@
     python3 tools/kernel.py extract PREFIX DIR                   ctl and code files (--probe-cs and sm86_lower input)
     python3 tools/kernel.py lower PREFIX [--tensor] [--out DIR]  sm86_lower: Maxwell .low and its .c1
     python3 tools/kernel.py xlate PREFIX [--tensor] [--out DIR]  lower, then oot_xlate: .spv, spirv-val, op histogram
+                                                                 (compute, task and mesh programs)
     python3 tools/kernel.py dis PREFIX [sm86_dis.py options]     tools/sm86_dis.py on the code
 
 PREFIX is the start of the input id (the <cache>/in/<id>.in name; OOT_CS_TIME and frame dumps print the same ids) or
@@ -76,7 +77,7 @@ def load(path: Path) -> dict:
         n += 1
     local = struct.unpack_from("<3I", control, 0x58) if stage == 5 and len(control) >= 0x64 else None
     shared = struct.unpack_from("<I", control, 0x64)[0] if stage == 5 and len(control) >= 0x68 else None
-    return {"id": path.stem, "path": path, "stage": {0: "vs", 4: "fs", 5: "cs"}.get(stage, str(stage)),
+    return {"id": path.stem, "path": path, "stage": {0: "vs", 4: "fs", 5: "cs", 6: "ts", 7: "ms"}.get(stage, str(stage)),
             "control": control, "code": code, "hash": f"{h:016x}", "insns": n, "ops": ops, "local": local,
             "shared": shared}
 
@@ -123,14 +124,38 @@ def spirv_tools() -> tuple[Path | None, Path | None]:
     return bins[-1] / "spirv-val.exe", bins[-1] / "spirv-dis.exe"
 
 
+def mesh_fields(k: dict) -> dict:
+    """A task or mesh program's job fields, as gfx_shader.c mesh_job writes them (the program's own shared memory is
+    taken as none, as in every program of the game): maximum vertices and primitives (control +0x60), the payload
+    (top byte of +0x58), and for a mesh program the output lines from the code header's VTG output map at 0x34."""
+    ctl, code = k["control"], k["code"]
+    w60, w58 = struct.unpack_from("<I", ctl, 0x60)[0], struct.unpack_from("<I", ctl, 0x58)[0]
+    max_v, max_p, payload = w60 & 0xFFFF, w60 >> 16, (w58 >> 24) // 4 * 256
+    lines = []
+    if k["stage"] == "ms":
+        lines += [-1 for bit in range(8) if code[0x34] >> bit & 1]
+        lines += [bit - 4 if bit >= 4 else -1 for bit in range(8) if code[0x35] >> bit & 1]
+        lines += [4 + vec * 4 + c for vec in range(32) for c in range(4) if code[0x36 + vec // 2] >> (4 * (vec & 1)) & 1 << c]
+        lines = lines[:160]
+        size = (max_v * len(lines) * 4 + 4 + 3 * max_p + 3) & ~3
+    else:
+        size = 0x10 + payload * 4
+    return {"shared": size, "local": [32, 1, 1],
+            "mesh": {"max_vertices": max_v, "max_primitives": max_p, "base": 0, "payload_words": payload, "lines": lines}}
+
+
 def xlate(k: dict, out: Path, tensor: int) -> None:
-    if k["stage"] != "cs":
-        sys.exit("kernel: xlate handles compute programs (stage cs) only")
+    if k["stage"] not in ("cs", "ts", "ms"):
+        sys.exit("kernel: xlate handles compute, task and mesh programs only")
     low, c1 = lower(k, out, tensor)
     key = k["id"][:16] + ("-tc" if tensor == 1 else f"-tc{tensor}" if tensor else "")
     jobs = out / "jobs.json"
-    jobs.write_text(json.dumps([{"key": key, "stage": "cs", "code": wpath(low), "c1": c1.read_bytes().hex(),
-                                 "debug": False, "local": list(k["local"] or (32, 1, 1)), "shared": k["shared"] or 0}]))
+    job = {"key": key, "stage": k["stage"], "code": wpath(low), "c1": c1.read_bytes().hex(), "debug": False}
+    if k["stage"] == "cs":
+        job |= {"local": list(k["local"] or (32, 1, 1)), "shared": k["shared"] or 0}
+    else:
+        job |= mesh_fields(k)
+    jobs.write_text(json.dumps([job]))
     spv_dir = out / "spv"
     spv_dir.mkdir(exist_ok=True)
     subprocess.run([str(XLATE), wpath(jobs), wpath(spv_dir)], capture_output=True)

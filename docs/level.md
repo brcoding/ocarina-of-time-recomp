@@ -294,3 +294,26 @@ After each change that alters what a shader computes: the `verify-shader-change`
     (#19's) with BC3 (run-130 against run-123): commit flat at 26.3 GiB, the GPU at 15.5-16.5 ms a frame outdoors
     instead of 20-28, a steady 30 fps (1% low 26-27 instead of 15-16), and 3.1% of the presents black (`OOT_DUMP_TRACE`,
     last target all zero) instead of 27.4%. Title at 30 s with and without: both pictures (noise 0.46 and 0.47).
+- 2026-11-09, late (RTX 4070): a guest crash leaving Link's house (the player's recorded walk
+  `build/logs/grass-route.txt`, run-585, about 100 s in; exit 71). Not reproduced: 0 of 7 replays of the same script
+  (runs 593-604; the script is timed by the world clock, so a replay drifts from the session). What it is:
+  - `main+0xc938d0` (from `main+0x560b38`, per-record geometry work) takes a record (x0, here `0x29bc11000`): a
+    position, a rotation, an object id at +0x1c (0xbf) and a flag at +0x20. It looks the id up in a table
+    (`[[0x7004e22540]+0x120]`: count at +0x840, pointers at +0x848) and reads +0x150 of the entry without a null
+    check; the entry was null, so it read address 0x150. The game trusts the id.
+  - The records are written each frame by the CPU job `main+0x2bfd750` (via `main+0x566fd0`, a different worker
+    thread each frame): it sets id -1 and flag 1 first, then copies the id from +0x4 of 0x30-byte entries of pass 0's
+    output, `0x29bb9c000` (the culling kernel 145fb221, its storage slot 10, 0x1d840 bytes), at offsets of 0x15fa0
+    and more (`OOT_WATCH_WRITE=0x29bc1101c:4 OOT_WATCH_REGS=1`: r8 held the buffer, rax the offset).
+  - Slot 10 is one of the game's own bindings, marked written by the translator (flags 1), so the whole range is
+    written back when the dispatch completes: the 256-byte write-back of pointer targets (above) does not apply. The
+    game reads it directly, with no pool invalidate, so `OOT_READBACK_LOG` (guest_read) never sees it.
+  - Suspect, not shown: at the area change the CPU job reads an instance list made for the previous area (or from its
+    inputs), whose ids the new area's table no longer holds. Hookshot met the same class of bug from the exposure
+    meter (ea78039, e84d467, read for behaviour only): a mirror copy taken at the wrong moment puts one side's older
+    words over the other's newer ones on pages both the CPU and GPU write. Next: a check at `main+0xc938d0`'s entry
+    counting records whose id has no entry, mirror mode against `OOT_MEMORY=import`, on a route that crosses areas.
+  - New diagnostic: `OOT_WATCH_REGS=1` adds the host registers to every `OOT_WATCH_WRITE` trap (watch.c).
+  - The replays also showed what the walk looks like: black frames with white blotches (NaN frames) indoors and out,
+    Link's white spikes, the overexposed canopy outdoors, and stalls of 250-320 ms outdoors with about 15 ms of replay
+    in them (the area streaming in, not rendering).
