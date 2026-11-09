@@ -70,6 +70,15 @@ static struct { int parsed, on, as_int, n, buf_slot, nreach, sample_shift; char 
 #define PT 7u
 #define NOREG 0xffffffffu
 
+// Tensor mode 2 (hmma_plan): how an HMMA or LDSM is lowered. role: HP_PAIR leads two HMMAs that share A and run as
+// one 16x16x16 multiply (partner: the second, which becomes HP_MOVED and emits nothing); HP_SINGLE an HMMA alone.
+// flags: which operands sit in registers in the AMD layout (MMA_NAT_*: no lanes to move), MMA_ACC16 a pair that
+// accumulates in f16, and on an LDSM which layout it loads.
+enum { HP_NONE, HP_PAIR, HP_MOVED, HP_SINGLE };
+enum { MMA_NAT_A = 1, MMA_NAT_B = 2, MMA_NAT_C = 4, MMA_NAT_D = 8, MMA_ACC16 = 16 };
+enum { LDSM_NAT_A = 1, LDSM_NAT_B = 2, LDSM_NAT_SWAP = 4 };
+typedef struct { uint8_t role, flags; uint32_t partner; } HPlan;
+
 typedef struct {
     const Insn *in;
     uint32_t n;
@@ -116,6 +125,7 @@ typedef struct {
     int tensor;                                    // HMMA to the MMA marker (sm86_lower_tensor_cores, compute)
     int hmma_count;                                // HMMAs lowered so far (OOT_TENSOR_HMMA_MASK)
     uint32_t shared_insns;                         // LDS, STS and LDSM lowered (Sm86Lowered.shared_insns)
+    HPlan *plan;                                   // [n]: tensor mode 2's pairs and AMD-layout operands (hmma_plan)
     uint32_t index;                                // the current native instruction
     int failed;
     char error[96];
@@ -765,6 +775,340 @@ static void scratch_at(L *l, uint32_t i) {
         if (best_len >= NSCRATCH) break;
     }
     l->scratch_base = best, l->scratch_len = best_len > NSCRATCH ? NSCRATCH : best_len, l->nscratch = 0;
+}
+
+// ---- tensor mode 2: HMMAs in pairs, operands kept in the AMD layout (hmma_plan)
+//
+// On 16x16x16 matrices (tools/xlate patch 0028, GenerateMatrixMultiplyAddPair) two HMMAs that read the same A run as
+// one multiply: B' = [B1 | B2] and the two accumulators side by side, half the multiplies and no padding. Each operand
+// still moves between lanes from HMMA's fragment layout into the AMD one (four subgroup shuffles and sixteen selects
+// per operand and pair) unless its registers already hold it in the AMD layout: an accumulator that a pair writes and
+// the next pair of its chain reads back as C; an A that an LDSM.x4 loaded (lane l's own row address points at its 16
+// bytes of A: one 128-bit load); a B pair that an LDSM.x4.trans loaded (a lane's column gathered from eight row
+// addresses, as the plain trans load does). Such registers form a web of definitions and uses, kept in the AMD layout
+// only when, along every path, every instruction reading them is a use expecting that layout and every definition
+// reaching those uses produces it. A web with any other reader, a partial or predicated write, or a use reached from
+// elsewhere stays in HMMA's layout, and its markers convert. OOT_TENSOR_NATIVE (diagnostic; gfx_shader.c keys the cache
+// by it): 0 no plan (one HMMA per marker), 1 pairs only, 2 pairs and accumulators, 3 (default) everything; an h after
+// the number makes pairs accumulate in f16 (MMA_ACC16: C inside and no conversions, but RDNA 4 then rounds within an
+// ulp of once, not once: oot.exe --probe-tensor).
+
+typedef struct { uint64_t use[4], def[4], may[4]; } RegView;   // reads (over), sure writes (under), any write (over)
+typedef struct { uint32_t r[4]; } Quad;                        // a web's registers in the order the AMD layout uses
+enum { WEB_ACC, WEB_A, WEB_B };
+
+static int hmma_shape_ok(const Insn *x) {   // the forms lower_hmma accepts
+    uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), rb = bits(x, 32, 8), rc = bits(x, 64, 8);
+    return bits(x, 72, 8) == 8 && !bits(x, 80, 12) && rd != RZ && ra != RZ && rb != RZ && rd <= 253 && ra <= 251 &&
+           rb <= 253 && (rc == RZ || rc <= 253);
+}
+static int runs_overlap(uint32_t a, uint32_t na, uint32_t b, uint32_t nb) {
+    return a != RZ && b != RZ && a < b + nb && b < a + na;
+}
+static int mask_any(const uint64_t a[4], const uint64_t b[4]) {
+    return (a[0] & b[0]) || (a[1] & b[1]) || (a[2] & b[2]) || (a[3] & b[3]);
+}
+
+// The registers instruction k reads and writes as the plan lowers it: a pair's second HMMA reads and writes at its
+// first. HMMA, LDSM and PLOP3 exactly (insn_regs counts bits 64-71 as a register of every ALU form; not of these).
+static void plan_view(const L *l, uint32_t k, RegView *v) {
+    memset(v, 0, sizeof *v);
+    const Insn *x = &l->in[k];
+    uint32_t op = x->w[0] & 0xfff, g = bits(x, 12, 4), rd = bits(x, 16, 8);
+    if (g == 15 || l->plan[k].role == HP_MOVED) return;
+    if (op == 0x23c) {
+        for (int m = 0; m < (l->plan[k].role == HP_PAIR ? 2 : 1); m++) {
+            const Insn *y = m ? &l->in[l->plan[k].partner] : x;
+            uint32_t yd = bits(y, 16, 8), rc = bits(y, 64, 8);
+            set_run(v->use, bits(y, 24, 8), 4), set_run(v->use, bits(y, 32, 8), 2);
+            if (rc != RZ) set_run(v->use, rc, 2);
+            set_run(g == 7 ? v->def : v->use, yd, 2), set_run(v->may, yd, 2);
+        }
+    } else if (op == 0x83b) {                                     // LDSM: the row address (a uniform one is not a GPR)
+        uint32_t n = 1u << bits(x, 72, 2);
+        set_run(v->use, bits(x, 24, 8), 1);
+        set_run(g == 7 ? v->def : v->use, rd, n), set_run(v->may, rd, n);
+    } else if (op != 0x81c) {                                     // PLOP3 reads and writes predicates only
+        // insn_regs counts a predicated write among the reads: any write is then any read or write.
+        insn_regs(x, v->use, v->def);
+        for (int w = 0; w < 4; w++) v->may[w] = v->use[w] | v->def[w];
+        if (op == 0x3a8 || op == 0x9a8) set_run(v->may, rd, 2);   // ATOMG: up to a 64-bit result
+        if (op == 0x321) set_run(v->may, rd, 4);                  // ALD: up to four components
+    }
+}
+
+static int quad_bits(const Quad *q, const uint64_t m[4]) {
+    int b = 0;
+    for (int i = 0; i < 4; i++) b |= get_bit(m, q->r[i]) << i;
+    return b;
+}
+static Quad quad2(uint32_t a, uint32_t b) { Quad q = {{a, a + 1, b, b + 1}}; return q; }
+
+// The ordered registers instruction k defines (def) or reads (!def) as a node of a web of this kind; 0 if it is none.
+static int web_node(const L *l, int kind, uint32_t k, int def, Quad *q) {
+    const Insn *x = &l->in[k];
+    uint32_t op = x->w[0] & 0xfff, role = l->plan[k].role;
+    if (kind == WEB_ACC || (kind == WEB_B && !def)) {
+        if (role != HP_PAIR) return 0;
+        const Insn *y = &l->in[l->plan[k].partner];
+        if (kind == WEB_B) return *q = quad2(bits(x, 32, 8), bits(y, 32, 8)), 1;
+        if (def) return *q = quad2(bits(x, 16, 8), bits(y, 16, 8)), 1;
+        if (bits(x, 64, 8) == RZ || bits(y, 64, 8) == RZ) return 0;
+        return *q = quad2(bits(x, 64, 8), bits(y, 64, 8)), 1;
+    }
+    if (kind == WEB_A && !def) {
+        if (role != HP_PAIR && role != HP_SINGLE) return 0;
+        uint32_t ra = bits(x, 24, 8);
+        return *q = quad2(ra, ra + 2), 1;
+    }
+    // An LDSM.x4 of the form lower_ldsm accepts, unconditional, into four aligned registers; trans for B, plain for A.
+    uint32_t rd = bits(x, 16, 8);
+    if (op != 0x83b || bits(x, 12, 4) != 7 || bits(x, 72, 2) != 2 || bits(x, 74, 4) || bits(x, 79, 12) || rd % 4 ||
+        rd + 3 >= RZ || (int)bits(x, 78, 1) != (kind == WEB_B))
+        return 0;
+    return *q = quad2(rd, rd + 2), 1;
+}
+
+// Whether a definition's registers d feed a use reading u: the same order, or for B the two halves swapped (the pair's
+// first HMMA reads the LDSM's third and fourth matrices); *swap says which.
+static int web_match(int kind, const Quad *d, const Quad *u, int *swap) {
+    *swap = 0;
+    if (!memcmp(d, u, sizeof *d)) return 1;
+    Quad s = {{d->r[2], d->r[3], d->r[0], d->r[1]}};
+    return kind == WEB_B && !memcmp(&s, u, sizeof s) && (*swap = 1);
+}
+
+// Of a use's reads, the ones other than the operand the web is about (they must not touch the web's registers).
+static void use_other_reads(const L *l, int kind, uint32_t k, uint64_t m[4]) {
+    memset(m, 0, 4 * sizeof *m);
+    for (int p = 0; p < (l->plan[k].role == HP_PAIR ? 2 : 1); p++) {
+        const Insn *y = p ? &l->in[l->plan[k].partner] : &l->in[k];
+        uint32_t rc = bits(y, 64, 8);
+        if (kind != WEB_A) set_run(m, bits(y, 24, 8), 4);
+        if (kind != WEB_B) set_run(m, bits(y, 32, 8), 2);
+        if (kind != WEB_ACC && rc != RZ) set_run(m, rc, 2);
+    }
+}
+
+typedef struct {
+    uint32_t *succ_at, *succ, *pred_at, *pred;               // the control flow as adjacency lists
+    uint32_t *parent;                                        // union-find over nodes (ACC: 2k definition, 2k+1 use)
+    uint8_t *bad, *has_def, *has_use;
+    int8_t *swap;                                            // per root: -1 none yet, 0, 1, 2 for a conflict
+    uint16_t *seen;                                          // per instruction: the masks a search has been at
+    uint32_t *stack, stack_cap;
+} Web;
+
+static uint32_t web_find(Web *w, uint32_t a) {
+    while (w->parent[a] != a) a = w->parent[a] = w->parent[w->parent[a]];
+    return a;
+}
+static void web_union(Web *w, uint32_t a, uint32_t b) {
+    a = web_find(w, a), b = web_find(w, b);
+    if (a == b) return;
+    w->parent[b] = a;
+    w->bad[a] |= w->bad[b], w->has_def[a] |= w->has_def[b], w->has_use[a] |= w->has_use[b];
+    if (w->swap[b] >= 0) w->swap[a] = w->swap[a] < 0 || w->swap[a] == w->swap[b] ? w->swap[b] : 2;
+}
+static void web_swap(Web *w, uint32_t a, int s) {
+    a = web_find(w, a);
+    w->swap[a] = w->swap[a] < 0 || w->swap[a] == s ? (int8_t)s : 2;
+}
+static int web_push(Web *w, uint32_t k, uint32_t m) {
+    if (w->seen[k] >> m & 1) return 1;
+    if (w->stack_cap < 2) return 0;
+    w->seen[k] |= (uint16_t)(1u << m);
+    w->stack[--w->stack_cap] = k, w->stack[--w->stack_cap] = m;
+    return 1;
+}
+
+// Forward from definition d (registers q): every instruction reached that reads a register still holding d's value must
+// be a use of this kind matching q with all four still held. Returns 0 when one is not.
+static int web_forward(const L *l, Web *w, int kind, uint32_t d, const Quad *q, uint32_t cap) {
+    memset(w->seen, 0, l->n * sizeof *w->seen), w->stack_cap = cap;
+    for (uint32_t s = w->succ_at[d]; s < w->succ_at[d + 1]; s++)
+        if (!web_push(w, w->succ[s], 0xf)) return 0;
+    uint32_t node_d = kind == WEB_ACC ? 2 * d : d;
+    while (w->stack_cap < cap) {
+        uint32_t m = w->stack[w->stack_cap++], k = w->stack[w->stack_cap++];
+        RegView v;
+        plan_view(l, k, &v);
+        Quad u;
+        int swap;
+        if (web_node(l, kind, k, 0, &u) && web_match(kind, q, &u, &swap)) {
+            uint64_t other[4];
+            use_other_reads(l, kind, k, other);
+            if (m != 0xf || (quad_bits(q, other) & (int)m)) return 0;
+            uint32_t node_u = kind == WEB_ACC ? 2 * k + 1 : k;
+            web_union(w, node_d, node_u);
+            if (kind == WEB_B) web_swap(w, node_u, swap);
+        } else if (quad_bits(q, v.use) & (int)m) {
+            return 0;
+        }
+        uint32_t left = m & ~(uint32_t)quad_bits(q, v.def);
+        if (quad_bits(q, v.may) & (int)left) return 0;          // a write that may or may not happen: a mix
+        if (!left) continue;
+        for (uint32_t s = w->succ_at[k]; s < w->succ_at[k + 1]; s++)
+            if (!web_push(w, w->succ[s], left)) return 0;
+    }
+    return 1;
+}
+
+// Backward from use u (registers q): along every path the first write to any of them must be one definition of this
+// kind writing all four in the same order. Returns 0 otherwise (another write, the program's entry).
+static int web_backward(const L *l, Web *w, int kind, uint32_t u, const Quad *q, uint32_t cap) {
+    memset(w->seen, 0, l->n * sizeof *w->seen), w->stack_cap = cap;
+    if (u == 0) return 0;
+    for (uint32_t s = w->pred_at[u]; s < w->pred_at[u + 1]; s++)
+        if (!web_push(w, w->pred[s], 0xf)) return 0;
+    uint32_t node_u = kind == WEB_ACC ? 2 * u + 1 : u;
+    while (w->stack_cap < cap) {
+        uint32_t m = w->stack[w->stack_cap++], k = w->stack[w->stack_cap++];
+        RegView v;
+        plan_view(l, k, &v);
+        if (quad_bits(q, v.may) & (int)m) {
+            Quad d;
+            int swap;
+            if (m != 0xf || !web_node(l, kind, k, 1, &d) || !web_match(kind, &d, q, &swap) ||
+                quad_bits(q, v.def) != 0xf)
+                return 0;
+            web_union(w, node_u, kind == WEB_ACC ? 2 * k : k);
+            continue;
+        }
+        if (k == 0) return 0;                                   // the entry with the registers still undefined
+        for (uint32_t s = w->pred_at[k]; s < w->pred_at[k + 1]; s++)
+            if (!web_push(w, w->pred[s], m)) return 0;
+    }
+    return 1;
+}
+
+static void hmma_plan(L *l) {
+    const char *env = getenv("OOT_TENSOR_NATIVE");
+    int level = env && *env ? atoi(env) : 3, acc16 = env && strchr(env, 'h');
+    if (l->tensor != 2 || !l->leader || level <= 0) return;
+    uint32_t n = l->n, hmmas = 0;
+    for (uint32_t k = 0; k < n; k++) hmmas += (l->in[k].w[0] & 0xfff) == 0x23c;
+    if (!hmmas) return;
+    l->plan = calloc(n, sizeof *l->plan);
+    Web w = {0};
+    w.succ_at = calloc(n + 1, sizeof *w.succ_at), w.pred_at = calloc(n + 2, sizeof *w.pred_at);
+    w.parent = malloc(2 * n * sizeof *w.parent), w.bad = calloc(2 * n, 1), w.has_def = calloc(2 * n, 1);
+    w.has_use = calloc(2 * n, 1), w.swap = malloc(2 * n), w.seen = calloc(n, sizeof *w.seen);
+    uint32_t cap = 32 * n + 64;
+    w.stack = malloc(cap * sizeof *w.stack);
+    uint8_t *eligible = calloc(n, 1);
+    if (!l->plan || !w.succ_at || !w.pred_at || !w.parent || !w.bad || !w.has_def || !w.has_use || !w.swap || !w.seen ||
+        !w.stack || !eligible)
+        goto out;
+    // The control flow as adjacency lists (successors, then predecessors by counting).
+    uint32_t t[72], nsucc = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        int c = successors(l, k, t, 72);
+        if (c < 0) goto out;
+        nsucc += (uint32_t)c;
+    }
+    w.succ = malloc((nsucc + 1) * sizeof *w.succ), w.pred = malloc((nsucc + 1) * sizeof *w.pred);
+    if (!w.succ || !w.pred) goto out;
+    for (uint32_t k = 0, at = 0; k < n; k++) {
+        int c = successors(l, k, t, 72);
+        w.succ_at[k] = at;
+        for (int s = 0; s < c; s++) w.succ[at++] = t[s], w.pred_at[t[s] + 2]++;
+        w.succ_at[k + 1] = at;
+    }
+    for (uint32_t k = 0; k < n; k++) w.pred_at[k + 2] += w.pred_at[k + 1];
+    for (uint32_t k = 0; k < n; k++)
+        for (uint32_t s = w.succ_at[k]; s < w.succ_at[k + 1]; s++) w.pred[w.pred_at[w.succ[s] + 1]++] = k;
+    // HMMAs that become markers (lower_hmma's conditions, OOT_TENSOR_HMMA_MASK by the order lower_hmma counts them).
+    const char *mask_env = getenv("OOT_TENSOR_HMMA_MASK");
+    uint64_t mask = mask_env && *mask_env ? strtoull(mask_env, NULL, 16) : ~0ull;
+    for (uint32_t k = 0, ord = 0; k < n; k++) {
+        const Insn *x = &l->in[k];
+        if ((x->w[0] & 0xfff) != 0x23c || bits(x, 12, 4) == 15) continue;
+        int masked = ord < 64 && !(mask >> ord & 1);
+        ord++;
+        eligible[k] = bits(x, 12, 4) == 7 && hmma_shape_ok(x) && !masked;
+    }
+    // Pairs: an HMMA and the next one in its block, if that reads the same A, does not read the first's result, and no
+    // instruction between them touches the second's result or writes its sources (the second then runs at the first).
+    for (uint32_t i = 0; i < n; i++) {
+        if (!eligible[i] || l->plan[i].role) continue;
+        l->plan[i].role = HP_SINGLE;
+        uint32_t j = i + 1;
+        while (j < n && j < i + 48 && !l->leader[j] && (l->in[j].w[0] & 0xfff) != 0x23c) j++;
+        if (j >= n || j >= i + 48 || l->leader[j] || !eligible[j]) continue;
+        const Insn *x = &l->in[i], *y = &l->in[j];
+        uint32_t ra = bits(x, 24, 8), di = bits(x, 16, 8), dj = bits(y, 16, 8), bj = bits(y, 32, 8);
+        uint32_t cj = bits(y, 64, 8);
+        if (bits(y, 24, 8) != ra || runs_overlap(di, 2, ra, 4) || runs_overlap(di, 2, bj, 2) ||
+            runs_overlap(di, 2, cj, 2) || runs_overlap(di, 2, dj, 2))
+            continue;
+        uint64_t out_j[4] = {0}, src_j[4] = {0};
+        set_run(out_j, dj, 2), set_run(src_j, ra, 4), set_run(src_j, bj, 2);
+        if (cj != RZ) set_run(src_j, cj, 2);
+        int clear = 1;
+        for (uint32_t k = i + 1; k < j && clear; k++) {
+            RegView v;
+            plan_view(l, k, &v);
+            clear = !mask_any(v.use, out_j) && !mask_any(v.may, out_j) && !mask_any(v.may, src_j);
+        }
+        if (!clear) continue;
+        l->plan[i].role = HP_PAIR, l->plan[i].partner = j, l->plan[j].role = HP_MOVED;
+        if (acc16) l->plan[i].flags |= MMA_ACC16;
+        if (l->liveness)                                         // the second's result is live from the first on
+            for (uint32_t k = i; k < j; k++) set_run(l->live_out[k], dj, 2);
+    }
+    // Webs: every definition searched forward, every use backward; then each web is kept in the AMD layout or not.
+    for (int kind = WEB_ACC; kind <= WEB_B; kind++) {
+        if ((kind == WEB_ACC && level < 2) || (kind != WEB_ACC && level < 3)) continue;
+        uint32_t nodes = kind == WEB_ACC ? 2 * n : n;
+        for (uint32_t a = 0; a < nodes; a++)
+            w.parent[a] = a, w.bad[a] = w.has_def[a] = w.has_use[a] = 0, w.swap[a] = -1;
+        for (uint32_t k = 0; k < n; k++) {
+            Quad q;
+            if (web_node(l, kind, k, 1, &q)) {
+                uint32_t node = kind == WEB_ACC ? 2 * k : k;
+                w.has_def[web_find(&w, node)] = 1;
+                if (!web_forward(l, &w, kind, k, &q, cap)) w.bad[web_find(&w, node)] = 1;
+            }
+            if (web_node(l, kind, k, 0, &q)) {
+                uint32_t node = kind == WEB_ACC ? 2 * k + 1 : k;
+                w.has_use[web_find(&w, node)] = 1;
+                if (!web_backward(l, &w, kind, k, &q, cap)) w.bad[web_find(&w, node)] = 1;
+            }
+        }
+        for (uint32_t k = 0; k < n; k++) {
+            for (int use = 0; use < 2; use++) {
+                Quad q;
+                if (!web_node(l, kind, k, !use, &q)) continue;
+                uint32_t r = web_find(&w, kind == WEB_ACC ? 2 * k + (uint32_t)use : k);
+                if (w.bad[r] || !w.has_def[r] || !w.has_use[r] || (kind == WEB_B && (w.swap[r] < 0 || w.swap[r] > 1)))
+                    continue;
+                HPlan *p = &l->plan[k];
+                if (kind == WEB_ACC) p->flags |= use ? MMA_NAT_C : MMA_NAT_D;
+                else if (use) p->flags |= kind == WEB_A ? MMA_NAT_A : MMA_NAT_B;
+                else p->flags |= kind == WEB_A ? LDSM_NAT_A : LDSM_NAT_B | (w.swap[r] ? LDSM_NAT_SWAP : 0);
+            }
+        }
+    }
+#ifdef SM86_TOOL
+    if (getenv("SM86_PLAN")) {
+        uint32_t pairs = 0, single = 0, f[4] = {0}, la = 0, lb = 0;
+        for (uint32_t k = 0; k < n; k++) {
+            HPlan *p = &l->plan[k];
+            if ((l->in[k].w[0] & 0xfff) == 0x83b) {
+                la += !!(p->flags & LDSM_NAT_A), lb += !!(p->flags & LDSM_NAT_B);
+                continue;
+            }
+            pairs += p->role == HP_PAIR, single += p->role == HP_SINGLE;
+            for (int b = 0; b < 4; b++) f[b] += !!(p->flags >> b & 1);
+        }
+        fprintf(stderr, "plan: %u HMMAs: %u pairs, %u single; native A %u, B %u, C %u, D %u; LDSM native A %u, B %u\n",
+                hmmas, pairs, single, f[0], f[1], f[2], f[3], la, lb);
+    }
+#endif
+out:
+    free(w.succ_at), free(w.pred_at), free(w.succ), free(w.pred), free(w.parent), free(w.bad), free(w.has_def);
+    free(w.has_use), free(w.swap), free(w.seen), free(w.stack), free(eligible);
 }
 
 // ---- operands
@@ -1742,7 +2086,41 @@ static void lower_ldsm(L *l, const Insn *x) {
         mov_reg(l, S(l, 6), ra);
         ra = S(l, 6);
     }
+    uint32_t nat = l->plan ? l->plan[l->index].flags : 0;
+    if (nat & LDSM_NAT_A) {
+        // The AMD layout of A for the marker (hmma_plan): lane l holds row l % 16 at k = 8 (l / 16) + e, which is row
+        // l & 7 of matrix l >> 3, whose address lane l itself holds: its 16 bytes in one load.
+        emit(l, l->pred | LDS(rd, ra, offset, 6));
+        return;
+    }
     uint32_t g = S(l, 0), t = S(l, 1), idx = S(l, 2), addr = S(l, 3);
+    if (nat & LDSM_NAT_B) {
+        // The AMD layout of B' = [B1 | B2] for a pair (hmma_plan; the trans matrices 0, 1 are B1's k 0-7, 8-15 and 2, 3
+        // B2's, or the other way round with LDSM_NAT_SWAP): lane l holds column l & 7 of HMMA j = (l >> 3) & 1 at
+        // k = 8 (l / 16) + e, i.e. column l & 7 of matrix m = 2 (j ^ swap) + (l >> 4), rows 0-7 from the addresses in
+        // lanes 8m..8m+7. Word w (rows 2w, 2w+1) goes to the w-th of the pair's B registers (Rb1, Rb1+1, Rb2, Rb2+1).
+        uint32_t h0 = S(l, 4), h1 = S(l, 5), first = S(l, 7);   // S(l, 6) may hold the row address (above)
+        emit(l, l->pred | S2R_LANEID(g));
+        emit(l, l->pred | (uint64_t)(LOP32I | t | ((uint64_t)g << 8) | ((uint64_t)7 << 20)));        // t = lane & 7
+        emit(l, l->pred | SHL_IMM(t, t, 1));                                                          // its byte offset
+        emit(l, l->pred | (uint64_t)(LOP32I | idx | ((uint64_t)g << 8) | ((uint64_t)8 << 20)));      // 8 j
+        emit(l, l->pred | SHL_IMM(idx, idx, 1));                                                      // 16 j
+        emit(l, l->pred | SHR_IMM(g, g, 1));
+        emit(l, l->pred | (uint64_t)(LOP32I | g | ((uint64_t)g << 8) | ((uint64_t)8 << 20)));        // 8 (l >> 4)
+        emit(l, base(l, 0x5c10000000000000ull, first, idx) | ((uint64_t)g << 20));                   // 8 m, swap aside
+        if (nat & LDSM_NAT_SWAP)                                                                      // ^ 16 (XOR)
+            emit(l, l->pred | (uint64_t)(LOP32I | first | ((uint64_t)first << 8) | ((uint64_t)16 << 20) | 2ull << 53));
+        for (uint32_t w = 0; w < 4; w++) {
+            for (uint32_t i = 0; i < 2; i++) {
+                emit(l, l->pred | IADD_IMM(idx, first, 2 * w + i));
+                emit(l, l->pred | SHFL_IDX_R(addr, ra, idx));
+                emit(l, base(l, 0x5c10000000000000ull, addr, addr) | ((uint64_t)t << 20));
+                emit(l, l->pred | LDS(i ? h1 : h0, addr, offset, 2));
+            }
+            emit(l, l->pred | PRMT_IMM(rd + (nat & LDSM_NAT_SWAP ? (w + 2) & 3 : w), h0, 0x5410, h1));
+        }
+        return;
+    }
     emit(l, l->pred | S2R_LANEID(g));
     emit(l, l->pred | (uint64_t)(LOP32I | t | ((uint64_t)g << 8) | ((uint64_t)3 << 20)));            // t = lane & 3
     emit(l, l->pred | SHR_IMM(g, g, 2));                                                              // g = lane >> 2
@@ -1791,8 +2169,22 @@ static void lower_hmma(L *l, const Insn *x) {
     const char *mask_env = getenv("OOT_TENSOR_HMMA_MASK");
     int masked = mask_env && *mask_env && hmma_n < 64 && !((strtoull(mask_env, NULL, 16) >> hmma_n) & 1);
     if (l->tensor && !masked && l->pred == (uint64_t)PT << 16) {
-        emit(l, 0xf7f0000000000000ull | (l->tensor == 2 ? 1ull << 48 : 0) | (uint64_t)rc << 39 | (uint64_t)rb << 20 |
-                    (uint64_t)PT << 16 | (uint64_t)ra << 8 | rd);
+        // Tensor mode 2 with a plan (hmma_plan): a pair is two markers in a row, bit 49 on the first (which patch 0028
+        // holds back) and bit 50 on the second (which runs both); bits 28-31 of the last say which operands are in the
+        // AMD layout (MMA_NAT_*). The second HMMA of a pair emits nothing where it stood.
+        const HPlan *p = l->plan ? &l->plan[l->index] : NULL;
+        if (p && p->role == HP_MOVED) return;
+        uint64_t mode = l->tensor == 2 ? 1ull << 48 : 0, flags = p ? (uint64_t)p->flags << 28 : 0;
+        if (p && p->role == HP_PAIR) {
+            const Insn *y = &l->in[p->partner];
+            emit(l, 0xf7f0000000000000ull | mode | 1ull << 49 | (uint64_t)rc << 39 | (uint64_t)rb << 20 |
+                        (uint64_t)PT << 16 | (uint64_t)ra << 8 | rd);
+            emit(l, 0xf7f0000000000000ull | mode | 1ull << 50 | flags | (uint64_t)bits(y, 64, 8) << 39 |
+                        (uint64_t)bits(y, 32, 8) << 20 | (uint64_t)PT << 16 | (uint64_t)ra << 8 | bits(y, 16, 8));
+            return;
+        }
+        emit(l, 0xf7f0000000000000ull | mode | flags | (uint64_t)rc << 39 | (uint64_t)rb << 20 | (uint64_t)PT << 16 |
+                    (uint64_t)ra << 8 | rd);
         return;
     }
     if (overlaps(rd, 2, ra, 4)) {                                 // the output reuses A's registers: A to scratch first
@@ -3243,6 +3635,7 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         l.liveness = compute_liveness(&l);
         if (!l.liveness) free(l.live_out), l.live_out = NULL;
     }
+    if (!l.failed) hmma_plan(&l);                             // tensor mode 2: pairs and AMD-layout operands
     if (sm86_probe_match(code, code_size)) {
         if (l.liveness || l.scratch_base + NSCRATCH > PROBE_REG + 1 - (uint32_t)(probe_spec.n ? probe_spec.n : 1))
             fail(&l, "OOT_PROBE: no register free for the capture");
@@ -3353,6 +3746,6 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         out->error_offset = header + l.error_index * 16;
         sm86_lower_free(out);
     }
-    free(l.out), free(l.first_out), free(l.reloc), free(l.leader), free(l.live_out);
+    free(l.out), free(l.first_out), free(l.reloc), free(l.leader), free(l.live_out), free(l.plan);
     return !l.failed;
 }

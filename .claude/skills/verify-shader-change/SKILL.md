@@ -17,7 +17,9 @@ order and stop at the first that fails.
 
 ## 2. Probes (seconds each, no game files)
 
-    build/v131072/oot.exe --probe-tensor     # LDSM, LDSM.trans, HMMA against a CPU reference
+    build/v131072/oot.exe --probe-tensor     # LDSM, LDSM.trans, HMMA against a CPU reference; HMMA pairs with
+                                             # an accumulator chain and swapped B halves (the 16x16x16 plan), and
+                                             # how the device rounds (once per HMMA, or after every step)
     build/v131072/oot.exe --probe-coopmat    # the device's cooperative-matrix shapes
     build/v131072/oot.exe --probe-vkmem      # texture layout (block-linear, GOB order), uploads
 
@@ -37,7 +39,9 @@ compare the `out_ssbo*.bin` files. Check first that the output is not trivial: a
 compute only its bias (12 distinct values), which proves nothing. Differences of a half-precision ulp or two are
 rounding (tensor cores accumulate once, the emulation per step); differences of the size of the values are a bug.
 `OOT_TENSOR_HMMA_MASK=<hex>` (with a fresh `OOT_SHADER_CACHE`) puts only the masked HMMAs of a kernel on the tensor
-path, to find the one that differs.
+path, to find the one that differs. On the 16x16x16 mapping (AMD) `OOT_TENSOR_NATIVE=0` lowers one HMMA per marker
+with every operand converted (the mapping before the pair plan), `1` pairs only, `2` pairs and accumulator chains,
+`3` (default) also A and B straight from LDSM; an `h` suffix accumulates pairs in f16. It has cache keys of its own.
 
 ## 4. Screenshots of a fixed scene, scored
 
