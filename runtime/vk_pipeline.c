@@ -1871,6 +1871,27 @@ static VkPipelineLayout half_layout(Layout *l, int h) {
 }
 
 // Builds one library from the pipeline's state; key is the library's key (PrKey: fin holds the added outputs).
+// A stage library whose vkCreateGraphicsPipelines took over two seconds: logged with its SPIR-V size, and with
+// OOT_SLOW_LIB_DUMP=1 its module written to slow-libs/ next to oot.exe, so the shaders the driver compiles slowly can
+// be looked at offline.
+static void lib_slow_note(int kind, double ms, const uint32_t *code, uint64_t words) {
+    if (ms < 2000.0 || !code) return;
+    static LONG n;
+    LONG i = InterlockedIncrement(&n);
+    rt_log("vk_pipeline: gpl: slow stage library %ld (kind %d): %llu SPIR-V words, %.0f ms", i, kind,
+           (unsigned long long)words, ms);
+    if (!cfg_bool("OOT_SLOW_LIB_DUMP")) return;
+    char dir[MAX_PATH * 2], path[MAX_PATH * 2 + 64];
+    DWORD len = GetModuleFileNameA(NULL, dir, sizeof dir);
+    char *cut = len && len < sizeof dir ? strrchr(dir, '\\') : NULL;
+    if (!cut) return;
+    strcpy(cut, "\\slow-libs");
+    CreateDirectoryA(dir, NULL);
+    snprintf(path, sizeof path, "%s\\lib-%03ld-k%d-%.0fms.spv", dir, i, kind, ms);
+    FILE *f = fopen(path, "wb");
+    if (f) fwrite(code, 4, (size_t)words, f), fclose(f);
+}
+
 static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPipelineLayout lay, const void *key) {
     static const VkGraphicsPipelineLibraryFlagsEXT part[4] = {
         VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
@@ -1908,6 +1929,8 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
     VkPipelineColorBlendAttachmentState cba[8];
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     uint32_t *patched = NULL;
+    const uint32_t *slow_code = NULL;   // the stage's module, for lib_slow_note
+    uint64_t slow_words = 0;
     VkPipeline pipe = VK_NULL_HANDLE;
     if (kind == LIB_VI) {
         if (!P.dyn_vi) {
@@ -1942,6 +1965,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         }
         else if (pk->xfb) LOG_ONCE("vk_pipeline: cannot add the transform feedback layout to the vertex shader");
         m = make_module(vcode, vw);
+        if (m && vcode != xp) slow_code = vcode, slow_words = vw;
         free(xp);
         if (!m) goto out;
         st.stage = VK_SHADER_STAGE_VERTEX_BIT, st.module = m;
@@ -1961,6 +1985,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             patched = fcode ? spirv_set(fcode, fw, 1) : NULL;
             free(d);
             if (!patched || !(m = make_module(patched, fw))) goto out;
+            slow_code = patched, slow_words = fw;
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT, st.module = m;
             pin_subgroup32(&st, &rq, scode, sw);
             pi.stageCount = 1, pi.pStages = &st;
@@ -1983,7 +2008,9 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         ri.depthAttachmentFormat = (VkFormat)k->depth, ri.stencilAttachmentFormat = (VkFormat)k->stencil;
         pi.pColorBlendState = &cb, pi.pMultisampleState = &ms;
     }
+    uint64_t t_create = qpc();
     if (vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    lib_slow_note(kind, ms_since(t_create), slow_code, slow_words);
 out:
     if (m) vkDestroyShaderModule(P.device, m, NULL);
     free(patched);
@@ -2214,7 +2241,11 @@ typedef struct Job {
     GKey k;
 } Job;
 
-#define MAX_WORKERS 4
+// A zone change brings dozens of new stage libraries at once, each built by the driver on one thread; with four
+// workers they queued behind each other while the rest of a 32-thread CPU idled. By default a third of the logical
+// processors, at most 12, which keeps the game's own threads their cores; OOT_PIPE_WORKERS (pipe_workers in oot.ini)
+// sets the count, up to 32.
+#define MAX_WORKERS 32
 
 static struct {
     int on;                            // set once by vk_pipeline_async_enable, before the replay runs
@@ -2518,7 +2549,12 @@ static DWORD WINAPI pipe_worker(void *arg) {
 static int workers_start(void) {
     if (A.threads) return 1;
     DWORD cpus = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    int n = cpus / 4 < 2 ? 2 : cpus / 4 > MAX_WORKERS ? MAX_WORKERS : (int)(cpus / 4);
+    int n = cpus / 3 < 2 ? 2 : cpus / 3 > 12 ? 12 : (int)(cpus / 3);
+    const char *want = cfg_get("OOT_PIPE_WORKERS");
+    if (want && *want) {
+        int w = atoi(want);
+        n = w < 1 ? 1 : w > MAX_WORKERS ? MAX_WORKERS : w;
+    }
     for (int i = 0; i < n; i++) {
         HANDLE t = CreateThread(NULL, 0, pipe_worker, (void *)(intptr_t)A.threads, 0, NULL);
         if (!t) break;

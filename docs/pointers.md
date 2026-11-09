@@ -138,3 +138,15 @@ matters; to be measured with `OOT_MEMORY=verify`.
   read it without a storage binding (the P2 patch should use that rather than reserving a slot). `vk_mem_shutdown`
   frees the table. P2 is to be rebuilt on top of 0022/0023 (the edits made before #12 are not in the tree). Hookshot
   (`docs/level.md`) does both: a pointer-pool table at c0+0x880 for task, mesh and compute, and a page-table fallback.
+- 2026-11-09: 0022's search made some fragment stages take minutes to build. A fragment shader of the Forest Temple
+  reads a 1 KB record through one untraced pointer, at +16, +20, ... : 253 calls of the same 16-entry table search,
+  which NVIDIA's driver inlined (4,000 guarded loads) and then optimised for 78-155 s per stage (RTX 5070, driver disk
+  cache off, `vk_pipeline.c lib_slow_note` logs every stage library over 2 s; `OOT_SLOW_LIB_DUMP=1` writes its
+  module to `slow-libs/` next to oot.exe). Every slow stage was one of these; the larger fragment stages without the
+  search built in under 2 s. Translator patch 0029 emits the multi-target GlobalToStorage helpers (`...Multi_c...`)
+  with `DontInline`: the slowest fragment library of the area now builds in 0.5 s, a cold load into the temple has no
+  draw waiting for a pipeline (it had dozens, up to 107 s), and the next start's prewarm builds the area's 430
+  pipelines in 0.4 s. Cost: GPU time per frame in the temple 11.6 ms against 10.9 (two runs each, `OOT_TRACE=perf`,
+  noisy). Searching once per base pointer instead of once per access would win that back and make the shader smaller;
+  not done. The pipeline workers went from at most 4 to a third of the logical processors (at most 12;
+  `OOT_PIPE_WORKERS` up to 32), since a zone change brings dozens of new stage libraries at once.
