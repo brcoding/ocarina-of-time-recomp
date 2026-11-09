@@ -21,8 +21,11 @@ order and stop at the first that fails.
     build/v131072/oot.exe --probe-coopmat    # the device's cooperative-matrix shapes
     build/v131072/oot.exe --probe-vkmem      # texture layout (block-linear, GOB order), uploads
 
-Kill afterwards: `taskkill.exe /F /IM oot.exe /T; taskkill.exe /F /IM oot_xlate.exe /T`.
-`OOT_TENSOR_CORES=0` (with `WSLENV=OOT_TENSOR_CORES`) runs a probe on the emulation for comparison.
+Run them through `tools/run.py`, which ends only its own game and that game's translator, since other sessions' games
+may be running: `python3 tools/run.py --seconds 60 --retry 0 -- --probe-tensor` (a private build adds
+`--exe DIR/oot.exe`). Never end games by image name: `taskkill /IM oot.exe` kills every session's runs. A stray one:
+`python3 tools/run.py --list` shows the live instances with their pids, `taskkill.exe /F /T /PID <pid>` ends one.
+`OOT_TENSOR_CORES=0` (`--env OOT_TENSOR_CORES=0`) runs a probe on the emulation for comparison.
 
 ## 3. One kernel, both ways, on data that exercises it
 
