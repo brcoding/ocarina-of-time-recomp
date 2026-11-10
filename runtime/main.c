@@ -185,6 +185,7 @@ const RtConfig *rt_config(void) { return &cfg; }
 
 // ---- runtime services the generated code calls (cpu.h)
 volatile int g_fnprof = 0;
+static int g_fps_ctrl = -1;   // OOT_FPS_CTRL (fps_ctrl_hit)
 
 // OOT_BREAK_AT=<module>+0x<offset>[,...] (at most 8): a log line at every entry of those lifted functions with the
 // caller, the argument registers and the first bytes behind x0 and x1 when they point into committed memory, for
@@ -199,6 +200,11 @@ static int g_break_count, g_watch_count;
 static volatile LONG g_break_hits;
 
 static void break_init(void) {
+    {
+        const char *f = cfg_get("OOT_FPS_CTRL");
+        if (f && *f) g_fps_ctrl = 0;   // logging only; OOT_FPS_MODE chooses the interval (frame_rate.c)
+        g_fnprof = 1;                  // until the controller is found (fnprof_hit)
+    }
     const char *e = cfg_get("OOT_BREAK_AT");
     if (!e || !*e) return;
     for (const char *p = e; *p && g_break_count < BREAK_MAX;) {
@@ -269,8 +275,37 @@ static void break_follow(const Cpu *c) {
     }
 }
 
+// OOT_FPS_CTRL=log|<fps> (diagnostic): the game's frame-rate controller (main+0x4dbda0, called once a frame with the
+// controller in x0 and the framework in x1) logged every 120 calls; with a number, its fixed-rate flag is set and its
+// rate forced to that, so the game's own setter (main+0x4dc0f0) applies it.
+static void fps_ctrl_hit(const Cpu *c) {
+    uint8_t *k = (uint8_t *)(uintptr_t)c->x[0], *fw = (uint8_t *)(uintptr_t)c->x[1];
+    static volatile LONG n;
+    LONG i = InterlockedIncrement(&n);
+    if (i % 120 != 1) return;
+    float m0, m1;
+    int32_t lo, hi, hyst, k2c, cur, c50, c54, fps, fwfps, tfps;
+    int64_t t0, t1, t2;
+    memcpy(&lo, k, 4), memcpy(&hi, k + 4, 4), memcpy(&m0, k + 8, 4), memcpy(&m1, k + 0xc, 4), memcpy(&hyst, k + 0x10, 4);
+    memcpy(&k2c, k + 0x2c, 4), memcpy(&cur, k + 0x48, 4), memcpy(&c50, k + 0x50, 4), memcpy(&c54, k + 0x54, 4), memcpy(&fps, k + 0x58, 4);
+    memcpy(&fwfps, fw + 0xfc, 4), memcpy(&t0, fw + 0x140, 8), memcpy(&t1, fw + 0x148, 8), memcpy(&t2, fw + 0x150, 8);
+    memcpy(&tfps, fw + 0x22c, 4);
+    rt_log("fps ctrl %p fw %p: interval %d..%d, margins %g %g, hysteresis %d, +2c %d, current interval %d, +50 %d, +54 %d, fps %d, "
+           "flag60 %#x; fw rate %d, +140 %lld, times %lld %lld ticks, +22c %d, +230 %u %u %u",
+           (void *)k, (void *)fw, lo, hi, m0, m1, hyst, k2c, cur, c50, c54, fps, k[0x60], fwfps, (long long)t0, (long long)t1,
+           (long long)t2, tfps, fw[0x230], fw[0x231], fw[0x232]);
+}
+
 void fnprof_hit(uint64_t addr, void *cpu) {
     const Cpu *c = cpu;
+    if (addr == 0x7003b4ef60ull) {
+        static volatile LONG bound;
+        if (!InterlockedExchange(&bound, 1)) {
+            frame_rate_mode_bind((void *)(uintptr_t)c->x[0]);
+            if (g_fps_ctrl < 0 && !g_break_count) g_fnprof = 0;   // the hook was on for this alone
+        }
+        if (g_fps_ctrl >= 0) fps_ctrl_hit(c);
+    }
     static volatile LONG resolved;
     if (!resolved) {
         for (int k = 0; k < g_break_count; k++)

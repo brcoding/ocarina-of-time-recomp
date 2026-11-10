@@ -174,9 +174,76 @@ double frame_step_limit_hz(void) {
     return r < LIMIT_MIN_HZ ? 60 : r > LIMIT_MAX_HZ ? LIMIT_MAX_HZ : r;
 }
 
+// ---- the game's own frame-rate modes (OOT_FPS_MODE)
+// The game steps its world by 1/60 s times its present interval and supports intervals 1 to 3 (60, 30 and 20 fps): its
+// frame-rate controller (main+0x3b4ef60, called once a frame; object fields: +0 and +4 the interval range, +0x48 the
+// interval, +0x58 and +0x5c the rate, +0x60 bit 0 the fixed-rate flag) would pick the interval from measured frame
+// times, but runs with the fixed-rate flag set, so it stays at interval 1 and a host that presents fewer than 60
+// frames a second plays in slow motion (2026-11-10: forced to interval 2, the opening ran twice as far in the same
+// wall time, and the game itself called nvnWindowSetPresentInterval(2)). In fixed mode the controller applies the
+// interval and rate of its fields every frame, so the host chooses them here from the frame's work time (the display
+// interval less what the pacer slept): up at once when the work no longer fits the interval, down only after 90
+// frames that would have fitted the shorter one with a tenth to spare.
+// OOT_FPS_MODE: auto (default), 0 off (the game's 60 fps mode whatever the host reaches), 1..3 that interval always.
+static uint8_t *_Atomic mode_ctrl;
+static _Atomic uint64_t mode_paced_ns;
+static int mode_cfg = -2;   // -1 auto, 0 off, 1..3 fixed
+void frame_rate_mode_paced(uint64_t ns) { atomic_fetch_add_explicit(&mode_paced_ns, ns, memory_order_relaxed); }
+void frame_rate_mode_bind(void *controller) {
+    if (mode_cfg == -2) {
+        const char *e = cfg_get("OOT_FPS_MODE");
+        mode_cfg = !e || !*e || !strcmp(e, "auto") ? -1 : atoi(e);
+        if (mode_cfg < -1 || mode_cfg > 3) mode_cfg = -1;
+    }
+    int32_t lo, hi;
+    memcpy(&lo, controller, 4), memcpy(&hi, (uint8_t *)controller + 4, 4);
+    rt_log("frame rate: the game's controller at %p, intervals %d..%d; OOT_FPS_MODE %s", controller, lo, hi,
+           mode_cfg < 0 ? "auto: the interval follows the frame time" : mode_cfg == 0 ? "0: left alone" : "fixed");
+    if (mode_cfg) atomic_store(&mode_ctrl, (uint8_t *)controller);
+}
+static void mode_present(double dt) {
+    uint8_t *k = atomic_load_explicit(&mode_ctrl, memory_order_relaxed);
+    uint64_t paced = atomic_exchange_explicit(&mode_paced_ns, 0, memory_order_relaxed);
+    if (!k) return;
+    static double ema;
+    static int cur = 1, fit;
+    int32_t lo, hi;
+    memcpy(&lo, k, 4), memcpy(&hi, k + 4, 4);
+    if (lo < 1 || hi > 6 || lo > hi || !(k[0x60] & 1)) return;   // not the object expected, or the game adjusts by itself
+    int want = cur;
+    double shown = ema;
+    if (mode_cfg > 0) want = mode_cfg;
+    else if (dt > 0.001 && dt < 0.25) {
+        double work = dt - (double)paced * 1e-9;
+        if (work < 0.001) work = 0.001;
+        ema = ema ? ema + 0.15 * (work - ema) : work;
+        shown = ema;
+        // A shorter interval is tried after `hold` fitting frames; when the game falls back within 3 s of the try
+        // (the work measured under the longer interval hides GPU time the pacer's sleep absorbed), the next try
+        // waits twice as long, up to a minute; a try that lasts resets the wait.
+        static int hold = 90, since_down = 1 << 30;
+        if (since_down < (1 << 30)) since_down++;
+        if (ema > cur / 60.0 * 1.08) {                        // does not fit (over 8% slow): a longer interval
+            want = cur + 1, fit = 0;
+            if (since_down < 180) hold = hold * 2 > 3600 ? 3600 : hold * 2;
+            since_down = 1 << 30, ema = 0;
+        } else if (cur > 1 && ema < (cur - 1) / 60.0 * 0.90) {
+            if (++fit >= hold) want = cur - 1, fit = 0, since_down = 0, ema = 0;
+        } else fit = 0;
+        if (since_down == 600) hold = 90;
+    }
+    if (want < lo) want = lo;
+    if (want > hi) want = hi;
+    if (want != cur) rt_log("frame rate: game interval %d -> %d (%d fps mode), frame work %.1f ms", cur, want, 60 / want, shown * 1e3);
+    cur = want;
+    int32_t iv = cur, fps = 60 / cur;
+    memcpy(k + 0x48, &iv, 4), memcpy(k + 0x58, &fps, 4), memcpy(k + 0x5c, &fps, 4);
+}
+
 void frame_step_present(uint64_t display_ns, int interval) {
     (void)interval;
     limit_live();
+    if (last_ns) mode_present((double)(display_ns - last_ns) * 1e-9);
     if (step_word && last_ns) {
         double dt = (double)(display_ns - last_ns) * 1e-9;
         if (dt > STEP_RESET_S || dt < 0.001) {

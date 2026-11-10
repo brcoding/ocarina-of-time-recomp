@@ -38,6 +38,7 @@ typedef struct Arena {
     VmaAllocation alloc;
     uint8_t *map;
     uint64_t size;
+    uint8_t *shadow;   // the same bytes in ordinary memory, for CPU reads (vk_usnap_peek): map is write-combined VRAM
 } Arena;
 
 typedef struct { uint64_t lo, hi; } Rng;
@@ -98,6 +99,11 @@ static Arena *arena_get(uint64_t need) {
         return NULL;
     }
     a->map = info.pMappedData;
+    // Reads of the mapping are reads of write-combined device memory: the pointer scan before every dispatch
+    // (vk_exec_draw.c ptr_scan) read its blocks from it and took 14% of the submitting thread, 5 ms a frame on the
+    // level (2026-11-10, OOT_PROFILE_RENDER: one load instruction held the samples).
+    a->shadow = malloc(a->size);
+    if (!a->shadow) rt_fatal("vk_usnap: out of memory");
     rt_log("vk_usnap: new arena of %.1f MiB", a->size / 1048576.0);
     return a;
 }
@@ -256,8 +262,10 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     }
     if (!U.nreg) return;
     if (!(U.arena = arena_get(total))) return;
-    for (int i = 0; i < U.nreg; i++)
-        memcpy(U.arena->map + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
+    for (int i = 0; i < U.nreg; i++) {   // the shadow first, the mapping from it: both hold the same bytes
+        memcpy(U.arena->shadow + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
+        memcpy(U.arena->map + U.reg[i].off, U.arena->shadow + U.reg[i].off, U.reg[i].hi - U.reg[i].lo);
+    }
     vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, 0, total);   // a no-op on coherent memory
     U.on = 1;
     U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
@@ -300,7 +308,7 @@ const void *vk_usnap_peek(uint64_t addr, uint64_t n) {
     if (i >= U.nreg) return NULL;
     const Reg *r = &U.reg[i];
     if (r->dropped || addr < r->lo || addr + n > r->hi) return NULL;
-    return U.arena->map + r->off + (addr - r->lo);
+    return U.arena->shadow + r->off + (addr - r->lo);
 }
 
 void vk_usnap_drop(uint64_t addr, uint64_t n) {

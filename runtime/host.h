@@ -282,6 +282,8 @@ uint64_t frame_step_ticks(void);                           // game time since th
 int rt_ab(void);
 int rt_knob(const char *name, const char *def);
 #define RT_KNOB_ON(mode) ((mode) == 2 ? rt_ab() : (mode))
+void frame_rate_mode_bind(void *controller);                // main.c: the game's frame-rate controller object, once found
+void frame_rate_mode_paced(uint64_t ns);                    // the pacer slept this long in the current frame
 void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
                                                            // present interval (60 Hz ticks)
 // ---- boot (boot.c, main.c)

@@ -50,8 +50,8 @@ def main():
     for name, n in per_fn.most_common(args.top):
         print(f'{n:8d} {100.0 * n / total:5.1f}%  {name}')
     if chains:
-        print(f'\nhottest call chains ({min(len(chains), 15)}):')
-        for n, chain in sorted(chains, reverse=True)[:15]:
+        print(f'\nhottest call chains ({min(len(chains), args.top)}):')
+        for n, chain in sorted(chains, reverse=True)[:args.top]:
             print(f'{n:8d}  ' + ' < '.join(chain))
 
 

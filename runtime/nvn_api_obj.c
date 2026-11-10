@@ -820,6 +820,13 @@ NVN_API(nvnWindowSetPresentInterval) {
     win_t *o = WN(c);
     int v = (int)arg_x(c, 1);
     if (o->interval != v) NVN_LOG("present interval %d -> %d", o->interval, v);
+    {   // the first calls and every change, with the caller: where the game decides its frame-rate mode
+        static volatile LONG said;
+        if (o->interval != v || InterlockedIncrement(&said) <= 3) {
+            char where[96];
+            rt_log("nvn: WindowSetPresentInterval(%d) (was %d) from %s", v, o->interval, ldr_describe(c->x[30], where, sizeof where));
+        }
+    }
     o->interval = v;
 }
 // void nvnWindowSetCrop(NVNwindow *w, int x, int y, int w, int h)
@@ -874,9 +881,10 @@ NVN_API(nvnWindowAcquireTexture) {
     *out = idx;
     uint64_t at = idx < 4 ? o->avail[idx] : 0;
     if (at) {
-        uint64_t p0 = perf_begin();
+        uint64_t p0 = perf_begin(), s0 = kern_now_ns();
         sleep_until(at);
         perf_end(PERF_PACE, p0);
+        frame_rate_mode_paced(kern_now_ns() - s0);
     }
     // The image is also free only once the GPU finished the frame it was last presented with: on the Switch the
     // display's release of the image implies that, and games count on it to keep their CPU at most a window's worth

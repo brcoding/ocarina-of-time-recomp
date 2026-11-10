@@ -539,6 +539,31 @@ NVN_API(nvnQueueFenceSync) {
 }
 // NVNsyncWaitResult nvnSyncWait(const NVNsync *s, uint64_t timeout_ns): a sync never fenced reports a timeout at once;
 // a fenced one is released only after the back end completed that fence value
+// OOT_SYNC_LOG=1 (diagnostic): the blocking SyncWaits per caller: how many, how long, and how many submits behind the
+// newest the awaited fence was (0: the game waits for the work it just submitted, so CPU and GPU frames do not overlap).
+static void sync_wait_note(uint64_t lr, uint64_t ns, uint64_t age, uint64_t timeout) {
+    static int on = -1;
+    if (on < 0) on = cfg_get("OOT_SYNC_LOG") != NULL;
+    if (!on) return;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static struct { uint64_t lr, n, ns, age, age0, tmo; } k[32];
+    static int nk, total;
+    AcquireSRWLockExclusive(&lock);
+    int i = 0;
+    while (i < nk && k[i].lr != lr) i++;
+    if (i == nk && nk < 32) k[nk++].lr = lr;
+    if (i < nk) k[i].n++, k[i].ns += ns, k[i].age += age, k[i].age0 += age == 0, k[i].tmo = timeout;
+    if (++total >= 600) {
+        for (int j = 0; j < nk; j++) {
+            char where[96];
+            rt_log("nvn: OOT_SYNC_LOG: %s: %llu waits, %.2f ms each, fence %.1f submits behind the newest (%llu at the newest), timeout %llu ns",
+                   ldr_describe(k[j].lr, where, sizeof where), (unsigned long long)k[j].n, (double)k[j].ns / (double)k[j].n / 1e6,
+                   (double)k[j].age / (double)k[j].n, (unsigned long long)k[j].age0, (unsigned long long)k[j].tmo);
+        }
+        memset(k, 0, sizeof k), nk = 0, total = 0;
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
 NVN_API(nvnSyncWait) {
     const sync_t *s = arg_p(c, 0);
     uint64_t timeout = arg_x(c, 1);
@@ -551,10 +576,12 @@ NVN_API(nvnSyncWait) {
     const GfxBackend *b = gfx_backend();
     if (b->fence_done() >= s->fence) { b->cpu_synced(s->fence); ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
     int ok;
+    uint64_t sw_t0 = kern_now_ns(), sw_age = nvn_fence_last() - s->fence;
     {
         NVN_BLOCKING();
         ok = b->fence_wait(s->fence, timeout);
     }
+    sync_wait_note(c->x[30], kern_now_ns() - sw_t0, sw_age, timeout);
     if (ok) b->cpu_synced(s->fence);
     else if (timeout) {
         // A blocking wait that gave up: on hardware such waits (the game's frame throttle, say) end in time; here a
