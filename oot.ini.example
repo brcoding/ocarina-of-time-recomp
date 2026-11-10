@@ -5,6 +5,10 @@
 # the file. Keys are case-insensitive; '#' and ';' start a comment; [sections] only group lines (runtime/cfg.c).
 
 [frame rate]
+# Each frame waits for the GPU before the game goes on (2), only for its commands to reach the GPU (1), or not (0).
+# 2 stops the black or unlit flashes when Navi or particles are in view (a CPU/GPU race, 2026-11-09), at some frame rate.
+# frame_sync = 0
+
 # Frame rate limit: 30, 60 (the Switch's rate), 90, 120, 144, any whole rate up to 360, or display (the monitor's
 # refresh rate). Above 60 is experimental and needs realtime = 1.
 # fps_limit = 60

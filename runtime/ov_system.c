@@ -381,6 +381,9 @@ static SRWLOCK account_lock = SRWLOCK_INIT;
 static Uid local;
 static uint64_t tokens[64], next_token = 1;
 
+// A parent that cannot be created is not an error by itself, as in fs_host.c make_dirs: on a UNC path
+// (//server/share/...) the server and the share are not directories CreateDirectoryW can make (error 161). Only the
+// directory itself must exist at the end.
 static void make_dirs(const char *dir) {
     char p[1100];
     need(snprintf(p, sizeof p, "%s", dir) < (int)sizeof p, "account: profile path too long");
@@ -390,9 +393,10 @@ static void make_dirs(const char *dir) {
         if (s[-1] != ':' && s[-1] != '/' && s[-1] != '\\') {
             *s = 0;
             wchar_t *w = fs_wide(p);
-            if (!CreateDirectoryW(w, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
-                rt_fatal("account: cannot create %s (error %lu)", p, GetLastError());
+            BOOL ok = CreateDirectoryW(w, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
             free(w);
+            if (!ok && !ch)
+                rt_fatal("account: cannot create %s (error %lu)", p, GetLastError());
             *s = ch;
         }
         if (!ch) break;

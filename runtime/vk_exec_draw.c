@@ -1097,6 +1097,8 @@ static int bank_k(int st) {   // the per-stage bank caches' index
     return st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : st == NVN_STAGE_TS ? 3 : st == NVN_STAGE_MS ? 4 : 2;
 }
 
+static uint64_t backing_left(uint64_t addr);
+
 static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
     int k = bank_k(st);
     // vk_c0_fill reads the storage slots, and the uniform slots and dispatch size for compute or the base instance for
@@ -1313,6 +1315,14 @@ static void cr_after_dispatch(VkExec *ex, uint32_t x, uint32_t y, uint32_t z) {
     CR.npend = 0;
     ex->recorded += m->n + 1;
     vk_completion_add(ex->fence, cr_done, m);
+}
+
+// The bytes from addr to the end of its backing, at most what a storage descriptor can span (0: not backed).
+static uint64_t backing_left(uint64_t addr) {
+    if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
+    VkMemSpan sp;
+    if (!addr || !vk_mem_resolve(addr, 1, &sp)) return 0;
+    return sp.avail < LIM.sbo_max ? sp.avail : LIM.sbo_max;
 }
 
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
@@ -3646,7 +3656,11 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
         // own shadow over the Deku Tree's first scene and on the water (found by bisecting with the player's recorded
         // route, build/logs/blob.txt). It loads from its storage slot 0 at negative offsets ([UR4 - 4], [UR4 - 16]),
         // which the other foliage programs do not: the suspect, not yet fixed. OOT_MESH_SKIP=none draws it.
-#define MESH_SKIP_DEFAULT "bd5a7c84"
+        // 808c17bb (the same task) draws a foliage mesh on the hill behind Link's house as long white spikes converging on a
+        // point, over the forest and the opening cutscene's Navi shots (found by bisecting the 40 mesh programs of that
+        // cutscene, 2026-11-09). Unlike its siblings, which work, it and bd5a7c84 address their data from storage slot 0
+        // (c0+0x770) rather than slot 1 (c0+0x780); binding slot 0 to the end of its backing did not change it.
+#define MESH_SKIP_DEFAULT "bd5a7c84,808c17bb"
         if (!parsed) {
             parsed = 1, skip = cfg_get("OOT_MESH_SKIP"), list = cfg_get("OOT_MESH_LIST") != NULL;
             if (!skip) skip = MESH_SKIP_DEFAULT;
@@ -3664,6 +3678,23 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
             if (!known && nseen < 128)
                 strcpy(seen[nseen++], hex), rt_log("vk_exec: OOT_MESH_LIST: mesh %s task %s program %llu, frame %llu", hex, ths,
                                                     (unsigned long long)ex->prog->serial, (unsigned long long)gfx_counters.frames);
+        }
+        {   // OOT_MESH_DUMP=<hex prefix> (diagnostic): the task and mesh bindings of that mesh program's first 3 draws
+            static const char *dump;
+            static int dparsed, dleft = 3;
+            if (!dparsed) dparsed = 1, dump = cfg_get("OOT_MESH_DUMP");
+            if (dump && *dump && dleft > 0 && !strncmp(hex, dump, strlen(dump))) {
+                dleft--;
+                for (int stg = NVN_STAGE_TS; stg <= NVN_STAGE_MS; stg += NVN_STAGE_MS - NVN_STAGE_TS)
+                    for (int k = 0; k < 16; k++) {
+                        const p_bind_buf *sb = &ex->ssbo[stg][k], *ub = &ex->ubo[stg][k];
+                        if (sb->addr) rt_log("vk_exec: OOT_MESH_DUMP %s %s ssbo %d: %#llx size %#llx backing %#llx", hex,
+                                             stg == NVN_STAGE_TS ? "ts" : "ms", k, (unsigned long long)sb->addr,
+                                             (unsigned long long)sb->size, (unsigned long long)backing_left(sb->addr));
+                        if (ub->addr) rt_log("vk_exec: OOT_MESH_DUMP %s %s ubo %d: %#llx size %#llx", hex,
+                                             stg == NVN_STAGE_TS ? "ts" : "ms", k, (unsigned long long)ub->addr, (unsigned long long)ub->size);
+                    }
+            }
         }
         if (skip && *skip) {
             int invert = *skip == '!', listed = 0;

@@ -602,6 +602,71 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
 
 void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
 
+// OOT_PASS_TIME=1 (diagnostic): the GPU time of every render pass, from timestamps around it, summed per kind (extent,
+// colour target count and first target's format, depth) and logged every PT_REPORT passes, the costliest first, with
+// the draws per pass. For finding which pass of the level's frame holds its ~23 ms of graphics work (2026-11-09).
+enum { PT_PAIRS = 4096, PT_KINDS = 96, PT_REPORT = 3000 };
+typedef struct { uint32_t w, h, nc, fmt, depth; uint64_t n, draws; double ns; } PtKind;
+typedef struct { uint32_t pair, w, h, nc, fmt, depth; uint64_t draws; } PtRead;
+static VkQueryPool pt_pool;
+static uint32_t pt_next;
+static volatile LONG pt_busy[PT_PAIRS];
+static PtKind pt_k[PT_KINDS];
+static int pt_nk, pt_reads;
+static SRWLOCK pt_lock = SRWLOCK_INIT;
+static int pt_pair = -1;
+static uint64_t pt_draws0;
+static int pt_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OOT_PASS_TIME");
+        on = e && atoi(e) ? 1 : 0;
+        if (on) {
+            VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                        .queryCount = 2 * PT_PAIRS};
+            if (vkCreateQueryPool(vk_ctx()->device, &qi, NULL, &pt_pool) != VK_SUCCESS) on = 0;
+            rt_log("vk_exec: OOT_PASS_TIME: %s", on ? "render passes timed on the GPU" : "no query pool, not timed");
+        }
+    }
+    return on;
+}
+static int pt_cmp(const void *a, const void *b) {
+    double x = ((const PtKind *)a)->ns, y = ((const PtKind *)b)->ns;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+static void pt_read(void *arg) {
+    PtRead *r = arg;
+    uint64_t v[2];
+    static double period;
+    if (!period) { VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pr); period = pr.limits.timestampPeriod; }
+    int ok = vkGetQueryPoolResults(vk_ctx()->device, pt_pool, 2 * r->pair, 2, sizeof v, v, sizeof v[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+             v[1] >= v[0];
+    InterlockedExchange(&pt_busy[r->pair], 0);
+    if (ok) {
+        AcquireSRWLockExclusive(&pt_lock);
+        int i = 0;
+        while (i < pt_nk && !(pt_k[i].w == r->w && pt_k[i].h == r->h && pt_k[i].nc == r->nc && pt_k[i].fmt == r->fmt && pt_k[i].depth == r->depth)) i++;
+        if (i == pt_nk && pt_nk < PT_KINDS) pt_k[pt_nk++] = (PtKind){r->w, r->h, r->nc, r->fmt, r->depth, 0, 0, 0};
+        if (i < pt_nk) pt_k[i].n++, pt_k[i].draws += r->draws, pt_k[i].ns += (double)(v[1] - v[0]) * period;
+        if (++pt_reads >= PT_REPORT) {
+            qsort(pt_k, (size_t)pt_nk, sizeof *pt_k, pt_cmp);
+            double all = 0;
+            for (int k = 0; k < pt_nk; k++) all += pt_k[k].ns;
+            rt_log("vk_exec: OOT_PASS_TIME: %d passes, %.1f ms of GPU time in %d kinds (frame %llu):", pt_reads, all / 1e6, pt_nk,
+                   (unsigned long long)gfx_counters.frames);
+            for (int k = 0; k < pt_nk && k < 25; k++) {
+                const PtKind *q = &pt_k[k];
+                rt_log("vk_exec:   %ux%u colour %u fmt %u depth %u x%llu: %.3f ms each, %.1f%%, %.1f draws each", q->w, q->h, q->nc, q->fmt,
+                       q->depth, (unsigned long long)q->n, q->ns / (double)q->n / 1e6, 100.0 * q->ns / all, (double)q->draws / (double)q->n);
+            }
+            memset(pt_k, 0, sizeof pt_k);
+            pt_nk = 0, pt_reads = 0;
+        }
+        ReleaseSRWLockExclusive(&pt_lock);
+    }
+    free(r);
+}
+
 void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
     resolve_rt(ex);
@@ -650,6 +715,15 @@ void vk_exec_pass_begin(VkExec *ex) {
                  ex->pass_ncolor, ex->pass_depth != 0, (unsigned long long)vk_sync_issued() + 1, (unsigned long long)gfx_counters.frames);
         vk_crumb_op(ex->cb, desc);
     }
+    if (pt_on()) {
+        uint32_t p = pt_next++ % PT_PAIRS;
+        pt_pair = -1;
+        if (!InterlockedCompareExchange(&pt_busy[p], 1, 0)) {
+            vkCmdResetQueryPool(ex->cb, pt_pool, 2 * p, 2);
+            vkCmdWriteTimestamp2(ex->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pt_pool, 2 * p);
+            pt_pair = (int)p, pt_draws0 = vk_exec_frame.draws;
+        }
+    }
     vkCmdBeginRendering(ex->cb, &ri);
     vk_exec_frame.passes++;
     ex->recorded++;
@@ -661,6 +735,17 @@ void vk_exec_pass_end(VkExec *ex) {
     vk_exec_oq_pass_end(ex);
     vk_exec_xfb_pass_end(ex, 0);
     vkCmdEndRendering(ex->cb);
+    if (pt_pair >= 0) {
+        vkCmdWriteTimestamp2(ex->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pt_pool, 2 * (uint32_t)pt_pair + 1);
+        PtRead *r = malloc(sizeof *r);
+        if (r) {
+            *r = (PtRead){(uint32_t)pt_pair, ex->pass_w, ex->pass_h, (uint32_t)ex->pass_ncolor,
+                          ex->pass_ncolor > 0 ? (uint32_t)ex->color[0].nvn_format : 0, ex->pass_depth ? 1u : 0u,
+                          vk_exec_frame.draws >= pt_draws0 ? vk_exec_frame.draws - pt_draws0 : 0};
+            vk_completion_add(ex->fence, pt_read, r);
+        } else InterlockedExchange(&pt_busy[pt_pair], 0);
+        pt_pair = -1;
+    }
     ex->recorded++;
     ex->in_pass = 0;
     vk_exec_xfb_pass_end(ex, 1);

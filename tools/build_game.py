@@ -280,7 +280,9 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         '  description = CC $in',
         '',
         'rule rc',
-        f'  command = {cmd_arg(WINDRES.as_posix())} -I {cmd_path(RUNTIME)} -O coff $in -o $out',
+        # --use-temp-file: GNU windres otherwise runs the preprocessor through popen, i.e. cmd.exe, which cannot start
+        # in a UNC directory (a checkout on a network share) and so loses the relative path of $in.
+        f'  command = {cmd_arg(WINDRES.as_posix())} --use-temp-file -I {cmd_path(RUNTIME)} -O coff $in -o $out',
         '  description = RC $in',
         '',
         'rule link',

@@ -23,9 +23,12 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
+#include "layout.h"
+
+#include <windows.h>
 
 #define STEP_SAMPLES 5
-#define STEP_MAX_S (1.0 / 15.0)   // longest step; a longer frame slows the game down
+#define STEP_MAX_S (1.0 / 15.0)   // longest step by default; a longer frame slows the game down (OOT_STEP_MIN_FPS)
 #define STEP_RESET_S 0.25         // a gap this long (loading, a debugger) restarts the average
 #define STEP_FIRST_S (1.0 / 60.0)
 #define LIMIT_MIN_HZ 30
@@ -39,17 +42,84 @@ static _Atomic uint64_t first_present_ns, last_present_ns;
 
 // +0 the step the frame update reads; +8 and +12 the frame-time pair (recomp/patches-v131072.txt: the game's
 // {1/60, 1/30} at main+0x13bf400, picked by its frame-rate mode), both the step.
+// Constant mode (ocarina-of-time-recomp, no patch table): this game keeps its frame time as the float 1/60 at
+// main+0x3e4066c, loaded by 252 sites (LDR S from the shared rodata word, found by scanning main for loads of 1/60 and
+// 1/30, 2026-11-09), and 1/30 at main+0x3e40b64 (17 sites, its 30 Hz work). The lifted code reads them from memory
+// (LD32), so writing the step into the words moves every site at once: at 60 fps they hold their own values. The page
+// is made writable once; a mismatch of either word (another build of the game) leaves the mode off.
+#define CONST60_OFF 0x3e4066cull
+#define CONST30_OFF 0x3e40b64ull
+static _Atomic uint32_t *const60, *const30;
+// The step the game's update actually advances by: the float at main+0x4d41204 (in .data), 1/60 while it runs (the
+// one exact 1/60 in main's writable image, OOT_F32_SCAN in gameplay, 2026-11-09; forcing it to 1/30 ran the opening
+// cutscene ahead at the same wall time). Written while it holds a step (about 1/60 or 1/30, or what was written last).
+#define STEPVAR_OFF 0x4d41204ull
+static uint32_t stepvar_last;
+static double step_max_s = STEP_MAX_S;
+
 static void step_store(float seconds) {
     uint32_t w;
     memcpy(&w, &seconds, 4);
+    if (const60) {
+        _Atomic uint32_t *sv = (_Atomic uint32_t *)(uintptr_t)(MOD_MAIN_BASE + STEPVAR_OFF);
+        uint32_t cur = atomic_load_explicit(sv, memory_order_relaxed);
+        float fc;
+        memcpy(&fc, &cur, 4);
+        if (cur == stepvar_last || (fc > 0.0165f && fc < 0.0168f) || (fc > 0.0332f && fc < 0.0335f)) {
+            atomic_store_explicit(sv, w, memory_order_relaxed);
+            stepvar_last = w;
+        }
+        float twice = seconds * 2.0f;
+        uint32_t w2;
+        memcpy(&w2, &twice, 4);
+        atomic_store_explicit(const30, w2, memory_order_relaxed);
+        atomic_store_explicit(const60, w, memory_order_release);
+        return;
+    }
     atomic_store_explicit(&step_word[2], w, memory_order_relaxed);
     atomic_store_explicit(&step_word[3], w, memory_order_relaxed);
     atomic_store_explicit(step_word, w, memory_order_release);
 }
 
+static int const_mode_init(void) {
+    // Opt-in (OOT_REALTIME=1): the words drive the game's animation and physics timing but not its movement, which
+    // counts frames, so at a low frame rate Link walked slowly while jumps and rolls ran on real time (2026-11-09).
+    const char *e = cfg_get("OOT_REALTIME");
+    if (!e || *e != '1') {
+        rt_log("frame rate: the game's fixed 1/60 s steps (OOT_REALTIME=1: real-time step, experimental)");
+        return 0;
+    }
+    uint32_t *a = (uint32_t *)(uintptr_t)(MOD_MAIN_BASE + CONST60_OFF), *b = (uint32_t *)(uintptr_t)(MOD_MAIN_BASE + CONST30_OFF);
+    if (*a != 0x3c888889u || *b != 0x3d088889u) {
+        rt_log("frame rate: the frame-time constants are not where this build of the game keeps them (%08x %08x): fixed steps",
+               *a, *b);
+        return 0;
+    }
+    DWORD old;
+    uintptr_t page = (uintptr_t)a & ~(uintptr_t)0xfff;
+    size_t len = ((uintptr_t)b | 0xfff) + 1 - page;
+    if (!VirtualProtect((void *)page, len, PAGE_READWRITE, &old)) {
+        rt_log("frame rate: cannot make the frame-time constants writable (error %lu): fixed steps", GetLastError());
+        return 0;
+    }
+    const60 = (_Atomic uint32_t *)a, const30 = (_Atomic uint32_t *)b;
+    const char *mf = cfg_get("OOT_STEP_MIN_FPS");   // the lowest frame rate the step keeps up with (default 15)
+    int fps = mf && *mf ? atoi(mf) : 15;
+    if (fps >= 5 && fps <= 60) step_max_s = 1.0 / fps;
+    rt_log("frame rate: real-time step through the game's frame-time constants (main+%#llx, main+%#llx; OOT_REALTIME=0 turns it off)",
+           (unsigned long long)CONST60_OFF, (unsigned long long)CONST30_OFF);
+    return 1;
+}
+
 void frame_step_init(void) {
     int realtime = rt_patch_set("realtime");
     if (realtime < 0) {
+        if (const_mode_init()) {
+            static uint32_t dummy[4];
+            step_word = (_Atomic uint32_t *)dummy;   // the step logic runs; step_store writes the constants
+            step_store((float)STEP_FIRST_S);
+            return;
+        }
         rt_log("frame rate: no patch table, the game's fixed 1/60 s steps");
         return;
     }
@@ -112,7 +182,7 @@ void frame_step_present(uint64_t display_ns, int interval) {
         if (dt > STEP_RESET_S || dt < 0.001) {
             sample_count = sample_next = 0;
         } else {
-            if (dt > STEP_MAX_S) dt = STEP_MAX_S;
+            if (dt > step_max_s) dt = step_max_s;
             samples[sample_next++ % STEP_SAMPLES] = dt;
             if (sample_count < STEP_SAMPLES) sample_count++;
             double sum = 0;

@@ -426,8 +426,97 @@ static void series_shot(const tex_t *t, uint64_t n) {
 // A --seconds run ends at the first present after the world clock (game time since the save's first frame,
 // frame_step_world_us) passed S seconds, so a run covers the same game time at any frame rate; any other frame is
 // counted by the back end only.
+static uint64_t frame_sync_fence;   // frame_sync 3: the last present's newest submit, waited for by the next submit
+static int frame_sync_mode(void) {
+    static int mode = -1;
+    if (mode < 0) mode = cfg_get("OOT_FRAME_SYNC") ? atoi(cfg_get("OOT_FRAME_SYNC")) : 0;
+    return mode;
+}
+void frame_sync_before_submit(void) {
+    if (frame_sync_mode() != 3) return;
+    uint64_t f = __atomic_exchange_n(&frame_sync_fence, 0, __ATOMIC_ACQ_REL);
+    if (f) vk_sync_fence_wait(f, UINT64_MAX);
+}
+
+// OOT_F32_SCAN=<present> (diagnostic, finding the game's frame step): at that present, every 4-byte word of main's
+// data and bss and of the committed guest heap whose float value is within 1% of 1/60 or 1/30 is logged (at most 400).
+// OOT_F32_SET=<addr>:<float>[,...] (diagnostic): those words are written at every present, to see which one moves the
+// game.
+static void f32_diag(uint64_t n) {
+    static int parsed;
+    static uint64_t scan_at;
+    static struct { uint64_t a; float v; } set[16];
+    static int nset;
+    if (!parsed) {
+        parsed = 1;
+        const char *e = cfg_get("OOT_F32_SCAN");
+        scan_at = e && *e ? strtoull(e, NULL, 10) : 0;
+        e = cfg_get("OOT_F32_SET");
+        for (const char *p = e; p && *p && nset < 16;) {
+            char *q;
+            uint64_t a = strtoull(p, &q, 0);
+            if (*q != ':') break;
+            float v = strtof(q + 1, &q);
+            set[nset].a = a, set[nset].v = v, nset++;
+            rt_log("boot: OOT_F32_SET %#llx = %g at every present", (unsigned long long)a, v);
+            p = *q == ',' ? q + 1 : q;
+            if (*q != ',') break;
+        }
+    }
+    for (int i = 0; i < nset; i++) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((void *)(uintptr_t)set[i].a, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
+            memcpy((void *)(uintptr_t)set[i].a, &set[i].v, 4);
+    }
+    if (!scan_at || n != scan_at) return;
+    int found = 0;
+    const float targets[2] = {1.0f / 60.0f, 1.0f / 30.0f};
+    // main's writable image, then every committed read-write region of the guest's address space below 0x7000000000
+    const RtLoaded *m = ldr_module(0);
+    uint64_t lo = m->base + m->data_off, hi = m->base + m->size;
+    for (int pass = 0; pass < 2 && found < 400; pass++) {
+        uint64_t a = pass ? 0x10000000ull : lo, end = pass ? 0x7000000000ull : hi;
+        while (a < end && found < 400) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) break;
+            uint64_t rb = (uint64_t)(uintptr_t)mbi.BaseAddress, re = rb + mbi.RegionSize;
+            if (re > end) re = end;
+            if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) && !(mbi.Protect & PAGE_GUARD))
+                for (uint64_t p = (rb > a ? rb : a + 3) & ~3ull; p + 4 <= re && found < 400; p += 4) {
+                    float v;
+                    memcpy(&v, (const void *)(uintptr_t)p, 4);
+                    for (int k = 0; k < 2; k++)
+                        if (v > targets[k] * 0.99f && v < targets[k] * 1.01f) {
+                            char where[96];
+                            rt_log("boot: OOT_F32_SCAN present %llu: %#llx = %.7g (%s)", (unsigned long long)n,
+                                   (unsigned long long)p, v, ldr_describe(p, where, sizeof where));
+                            found++;
+                        }
+                }
+            a = re > a ? re : a + 0x1000;
+        }
+    }
+    rt_log("boot: OOT_F32_SCAN present %llu: %d words found", (unsigned long long)n, found);
+}
+
 void rt_frame_presented(const tex_t *t, uint64_t n) {
+    f32_diag(n);
     const RtConfig *cfg = rt_config();
+    // OOT_FRAME_SYNC=1: each present drains the asynchronous replay (the game's commands of the frame reach the GPU
+    // before the game goes on); 2: and waits for the GPU to finish them. The shot ring does both as a side effect, and
+    // with it the black flashes whenever Navi or particles were in view did not happen (2026-11-09): the game reads
+    // back a value the GPU had not written yet. Costs frame rate (no overlap of CPU and GPU work).
+    // 3: the game's logic for the next frame overlaps the GPU's work on this one, but its first submit waits until the
+    // GPU finished this frame (frame_sync_before_submit): what the game reads back of the previous frame is complete
+    // by the time it records the next frame's GPU work.
+    int frame_sync = frame_sync_mode();
+    if (frame_sync == 1 || frame_sync == 2) { if (gfx_replay_async()) gfx_backend()->finish(); }
+    if (frame_sync == 2) { uint64_t f = vk_sync_latest(); if (f) vk_sync_fence_wait(f, UINT64_MAX); }
+    if (frame_sync == 3) {
+        if (gfx_replay_async()) gfx_backend()->finish();
+        __atomic_store_n(&frame_sync_fence, vk_sync_latest(), __ATOMIC_RELEASE);
+    }
     series_shot(t, n);
     ring_shot(t, n);
     int64_t w = cfg->seconds ? frame_step_world_us() : -1;

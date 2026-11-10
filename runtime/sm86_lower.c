@@ -105,6 +105,16 @@ typedef struct {
     uint8_t ur_pair[64];                           // n is half of a 64-bit pair (UIMAD.WIDE, ULDC.64): adjacent registers
     uint32_t ur_first[64], ur_last[64];            // the instructions a uniform register is touched at, first and last
     uint8_t ur_whole[64];                          // a use before its first definition: live over the whole program
+    uint32_t up_first, up_last;                    // the instructions naming a uniform predicate, first and last (+1)
+    uint32_t span_a[64], span_b[64];               // liveness mode: the instructions over which uniform register n
+    uint8_t span_ok[64];                           // must hold its value (widen_span); its register is written only there
+    uint32_t *fwd_slot;                            // [n]: a block leader's row in fwd_in (0 none, else row + 1)
+    int webs;                                      // liveness mode: uniform registers split into webs (build_webs)
+    int def_ctx;                                   // ur() is asked for the register a definition writes
+    uint16_t *web_rd, *web_df;                     // [n * 64]: the web (+1) uniform register r is read / written in
+    struct { uint32_t a, b; uint8_t base, pair, reg; } *web;   // per web: span, first uniform register, register
+    uint32_t nweb;
+    uint8_t (*fwd_in)[64][8];                      // per block: the constants the uniform registers hold on entry
     int scanned;                                   // needs_reg is final: a read of another register is a scan bug
     uint32_t used_preds;                           // predicates the program touches (bit n = Pn)
     uint8_t up_map[8];                             // uniform predicate -> predicate (0xff unmapped, 7 = UPT)
@@ -200,6 +210,31 @@ struct Src {
 static Src reg_src(uint32_t r) { Src s = {0}; s.reg = r; return s; }
 
 // The general register standing in for uniform register n (URZ = RZ).
+static int successors(const L *l, uint32_t i, uint32_t *out, uint32_t cap);
+// A span of instructions a..b over which a value the lowering keeps in a register must survive, widened over every
+// loop that overlaps it: a backward branch j -> t with t <= b and j >= a runs instructions outside a..b between two
+// visits of the span (the rest of the loop body), where the program may write the register. Repeated until no loop
+// widens it further. Without block information (an unknown jump table) the whole program.
+static void widen_span(L *l, uint32_t *a, uint32_t *b) {
+    if (!l->leader) { *a = 0, *b = l->n - 1; return; }
+    uint32_t t[72];
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (uint32_t j = 0; j < l->n; j++) {
+            uint32_t op = l->in[j].w[0] & 0xfff;
+            if (!(op == 0x947 || op == 0x949 || op == 0x958)) continue;
+            int n = successors(l, j, t, 72);
+            if (n < 0) { *a = 0, *b = l->n - 1; return; }
+            for (int k = 0; k < n; k++)
+                if (t[k] <= j && t[k] <= *b && j >= *a && (t[k] < *a || j > *b)) {
+                    if (t[k] < *a) *a = t[k];
+                    if (j > *b) *b = j;
+                    changed = 1;
+                }
+        }
+    }
+}
+
 // Liveness mode: a register neither reserved nor live anywhere in instructions a..b (NOREG when there is none).
 static uint32_t alloc_dead(L *l, uint32_t a, uint32_t b) {
     uint64_t busy[4];
@@ -215,6 +250,11 @@ static uint32_t ur(L *l, uint32_t n) {
     if (n == 63) return RZ;
     if (n > 63) return fail(l, "uniform register number"), RZ;
     if (l->scanned && !l->needs_reg[n]) return fail(l, "uniform register read the scan did not see"), RZ;
+    if (l->webs) {
+        uint32_t w = (l->def_ctx ? l->web_df : l->web_rd)[(size_t)l->index * 64 + n];
+        if (!w) return l->def_ctx ? RZ : (fail(l, "uniform register read outside its webs"), RZ);
+        return l->web[w - 1].reg + (n - l->web[w - 1].base);
+    }
     if (!l->ur_map[n]) {
         uint32_t r = NOREG;
         if (l->ur_pair[n] && l->needs_reg[n ^ 1] && !l->ur_map[n ^ 1] && l->ur_next + 1 < l->scratch_base) {
@@ -229,14 +269,9 @@ static uint32_t ur(L *l, uint32_t n) {
             // No room above the program's registers: one dead over the instructions the uniform register spans
             // (the whole program when it is read before any definition); a pair takes two adjacent ones dead over
             // both halves' spans.
-            uint32_t a = l->ur_whole[n] || !l->ur_first[n] ? 0 : l->ur_first[n] - 1;
-            uint32_t b = l->ur_whole[n] || !l->ur_last[n] ? l->n - 1 : l->ur_last[n] - 1;
+            uint32_t a = l->span_ok[n] ? l->span_a[n] : 0, b = l->span_ok[n] ? l->span_b[n] : l->n - 1;
             if (l->ur_pair[n] && l->needs_reg[n ^ 1] && !l->ur_map[n ^ 1]) {
-                uint32_t m = n ^ 1, e = n & ~1u;
-                uint32_t a2 = l->ur_whole[m] || !l->ur_first[m] ? 0 : l->ur_first[m] - 1;
-                uint32_t b2 = l->ur_whole[m] || !l->ur_last[m] ? l->n - 1 : l->ur_last[m] - 1;
-                if (a2 < a) a = a2;
-                if (b2 > b) b = b2;
+                uint32_t e = n & ~1u;
                 uint64_t busy[4];
                 memcpy(busy, l->reserved, sizeof busy);
                 for (uint32_t i = a; i <= b && i < l->n; i++)
@@ -271,10 +306,23 @@ static Src ur_src(L *l, uint32_t n) {
 }
 
 // Does uniform register n have a register at all (false: every use forwards a constant, or there is no use)?
-static int ur_has_reg(const L *l, uint32_t n) { return n < 63 && l->ur_def[n].kind == 3 && l->needs_reg[n]; }
+// In liveness mode a definition outside the register's span writes nothing: no read of the register follows it before
+// a definition inside the span (the span runs from the first definition to the last read that needs the register,
+// widened over loops), and the register may be live in the program there.
+static int ur_has_reg(const L *l, uint32_t n) {
+    if (!(n < 63 && l->ur_def[n].kind == 3 && l->needs_reg[n])) return 0;
+    if (l->webs) return l->web_df[(size_t)l->index * 64 + n] != 0;   // a definition no register read reaches: none
+    return !l->liveness || !l->span_ok[n] || (l->index >= l->span_a[n] && l->index <= l->span_b[n]);
+}
 
 // The register a definition of uniform register n writes: RZ when it has none (the value is never read as such).
-static uint32_t ur_dst(L *l, uint32_t n) { return ur_has_reg(l, n) ? ur(l, n) : RZ; }
+static uint32_t ur_dst(L *l, uint32_t n) {
+    if (!ur_has_reg(l, n)) return RZ;
+    l->def_ctx = 1;
+    uint32_t r = ur(l, n);
+    l->def_ctx = 0;
+    return r;
+}
 
 // Uniform registers n and n + 1 as an adjacent register pair, in scratch k, k + 1 when they are forwarded
 // constants or not adjacent in the mapping.
@@ -317,6 +365,7 @@ static uint32_t up(L *l, uint32_t n) {
 static int uniform_op(uint32_t op);
 static uint32_t up_fields(const Insn *x);
 static uint32_t up_register(L *l);
+static void plop3_table_regs(L *l, uint32_t pd, uint32_t lut, const uint32_t in_[3], const int uni[3], uint32_t upr);
 static int successors(const L *l, uint32_t i, uint32_t *out, uint32_t cap);
 static void scratch_at(L *l, uint32_t i);
 
@@ -491,7 +540,7 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
                    (bits(x, 72, 1) || base == 0x1a8 || base == 0x3a8 || base == 0x18e ? 2 : 1) : (base == 0x025 ? 1 : 1);
     if (!no_a) set_run(use, f24, a_w);
     if (b_reg) set_run(use, f32, tex ? 4 : store ? by_size : 1);
-    if (c_reg || base == 0x122 || base == 0x189 || tex) set_run(use, f64, base == 0x025 ? 2 : tex ? 1 : 1);
+    if (c_reg || base == 0x122 || base == 0x189 || base == 0x1a9 || tex) set_run(use, f64, base == 0x025 ? 2 : tex ? 1 : 1);   // 0x1a9: CAS new value
     if (base == 0x122) set_run(use, f32, bits(x, 74, 2) + 1);     // AST data
     if (base == 0x121) set_run(use, f32, 1);                      // ALD vertex register
     if (base == 0x03c) {                                          // HMMA: A 4, B 2, C 2 read; D 2 written (f16 accumulators)
@@ -564,6 +613,74 @@ static uint32_t ur_write(const Insn *x, int *pair, uint8_t *kind, uint8_t *bank,
     return 63;
 }
 
+// Forwarding across blocks: what each uniform register holds on entry to each block, where every path into the block
+// agrees on it (a constant word or an immediate), by iterating the forward dataflow over the blocks to a fixed point.
+// A row is 64 entries of {kind, bank, value (4 bytes)} as the local forwarding keeps them (kind 0 unknown, 1 constant,
+// 2 immediate, 3 computed); 0xff marks a block not reached yet. Without blocks (an unknown jump table) nothing.
+typedef struct { uint8_t kind, bank, pad[2]; uint32_t value; } UrVal;
+static void fwd_step(const Insn *x, UrVal cur[64]) {
+    int pair;
+    uint8_t kind, bank;
+    uint32_t value;
+    uint32_t w = ur_write(x, &pair, &kind, &bank, &value);
+    if (w >= 63) return;
+    cur[w].kind = kind, cur[w].bank = bank, cur[w].value = value;
+    if (pair && w + 1 < 63) cur[w + 1].kind = kind == 1 ? 1 : 3, cur[w + 1].bank = bank, cur[w + 1].value = value + 4;
+}
+static void fwd_build(L *l) {
+    if (!l->leader) return;
+    uint32_t rows = 0;
+    l->fwd_slot = calloc(l->n, sizeof *l->fwd_slot);
+    if (!l->fwd_slot) return;
+    for (uint32_t i = 0; i < l->n; i++) if (l->leader[i]) l->fwd_slot[i] = ++rows;
+    UrVal (*in)[64] = malloc(rows * sizeof *in);
+    uint8_t *dirty = calloc(rows, 1);
+    if (!in || !dirty) { free(in), free(dirty), free(l->fwd_slot), l->fwd_slot = NULL; return; }
+    for (uint32_t r = 0; r < rows; r++)
+        for (int k = 0; k < 64; k++) in[r][k] = (UrVal){.kind = 0xff};
+    memset(in[0], 0, sizeof in[0]);                          // the entry: nothing known
+    dirty[0] = 1;
+    uint32_t t[72];
+    for (int changed = 1, rounds = 0; changed && rounds < 1000; rounds++) {
+        changed = 0;
+        for (uint32_t i = 0; i < l->n; i++) {
+            if (!l->leader[i] || !dirty[l->fwd_slot[i] - 1]) continue;
+            dirty[l->fwd_slot[i] - 1] = 0;
+            UrVal cur[64];
+            memcpy(cur, in[l->fwd_slot[i] - 1], sizeof cur);
+            uint32_t j = i;
+            for (;; j++) {
+                fwd_step(&l->in[j], cur);
+                if (j + 1 >= l->n || l->leader[j + 1]) break;
+            }
+            int ns = successors(l, j, t, 72);
+            if (ns < 0) { free(in), free(dirty), free(l->fwd_slot), l->fwd_slot = NULL; return; }
+            for (int q = 0; q < ns; q++) {
+                if (t[q] >= l->n || !l->fwd_slot[t[q]]) continue;
+                UrVal *d = in[l->fwd_slot[t[q]] - 1];
+                int moved = 0;
+                for (int k = 0; k < 64; k++) {
+                    UrVal m = d[k];
+                    if (m.kind == 0xff) m = cur[k];
+                    else if (!((m.kind == 1 || m.kind == 2) && m.kind == cur[k].kind && m.bank == cur[k].bank && m.value == cur[k].value))
+                        m = (UrVal){0};
+                    if (memcmp(&m, &d[k], sizeof m)) d[k] = m, moved = 1;
+                }
+                if (moved) dirty[l->fwd_slot[t[q]] - 1] = 1, changed = 1;
+            }
+        }
+    }
+    for (uint32_t r = 0; r < rows; r++)
+        for (int k = 0; k < 64; k++) if (in[r][k].kind == 0xff || in[r][k].kind == 3) in[r][k] = (UrVal){0};
+    free(dirty);
+    l->fwd_in = (uint8_t (*)[64][8])in;
+}
+// Block entry state for the local forwarding: the dataflow's row, or nothing known.
+static void fwd_enter(const L *l, uint32_t i, void *cur) {
+    if (l->fwd_slot && l->fwd_in && l->fwd_slot[i]) memcpy(cur, l->fwd_in[l->fwd_slot[i] - 1], 64 * 8);
+    else memset(cur, 0, 64 * 8);
+}
+
 // Uniform register definitions: a register with one definition that is a direct 32-bit ULDC (or a pair, or a
 // UMOV immediate) is forwarded as that constant; the others get general registers. Predicates: every field
 // that can name one is counted as used (over-marking only shrinks the pool for the uniform predicates).
@@ -605,10 +722,12 @@ static void scan_uniform(L *l) {
     // get one each, above the program's registers, and the scratch block starts above them.
     {
         struct { uint8_t kind, bank; uint32_t value; } cur[64];
+        _Static_assert(sizeof cur == 64 * 8, "forwarding row layout");
+        fwd_build(l);
         memset(cur, 0, sizeof cur);
         for (uint32_t i = 0; i < l->n; i++) {
             const Insn *x = &l->in[i];
-            if (l->leader && l->leader[i]) memset(cur, 0, sizeof cur);
+            if (l->leader && l->leader[i]) fwd_enter(l, i, cur);
             uint32_t reads[8][2];
             int nr = ur_reads(x, reads);
             for (int k = 0; k < nr; k++)
@@ -616,19 +735,17 @@ static void scan_uniform(L *l) {
                     uint32_t n = reads[k][0] + c;
                     if (n >= 63) continue;
                     int forwards = l->ur_def[n].kind == 1 || l->ur_def[n].kind == 2 || cur[n].kind == 1 || cur[n].kind == 2;
-                    if (!forwards) l->needs_reg[n] = 1;
-                    if (!l->ur_first[n] && !l->ur_last[n]) l->ur_whole[n] = 1;   // read before any definition
-                    if (!l->ur_first[n]) l->ur_first[n] = i + 1;
+                    if (forwards) continue;                    // the constant, not the register: outside its span
+                    l->needs_reg[n] = 1;
+                    if (!l->ur_first[n]) l->ur_whole[n] = 1, l->ur_first[n] = i + 1;   // read before any definition
                     l->ur_last[n] = i + 1;
                 }
             int pair;
             uint8_t kind, bank;
             uint32_t value;
             uint32_t w = ur_write(x, &pair, &kind, &bank, &value);
-            for (int k = 0; w < 63 && k <= pair && w + k < 63; k++) {
+            for (int k = 0; w < 63 && k <= pair && w + k < 63; k++)   // a definition starts the span, a read ends it
                 if (!l->ur_first[w + k]) l->ur_first[w + k] = i + 1;
-                l->ur_last[w + k] = i + 1;
-            }
             if (w < 63) {
                 cur[w].kind = kind, cur[w].bank = bank, cur[w].value = value;
                 if (pair && w + 1 < 63) cur[w + 1].kind = kind == 1 ? 1 : 3, cur[w + 1].bank = bank, cur[w + 1].value = value + 4;
@@ -669,7 +786,14 @@ static void scan_uniform(L *l) {
     // Swap mode when the uniform predicates do not fit in the predicates the program leaves free (counting only all
     // seven used left a program with five ordinary and three uniform predicates without one: "no predicate free").
     uint32_t ups = 0;
-    for (uint32_t i = 0; i < l->n; i++) ups |= up_fields(&l->in[i]);
+    for (uint32_t i = 0; i < l->n; i++) {
+        uint32_t f = up_fields(&l->in[i]);
+        ups |= f;
+        if (f) {
+            if (!l->up_first) l->up_first = i + 1;
+            l->up_last = i + 1;
+        }
+    }
     l->up_swap = __builtin_popcount(l->used_preds & 0x7f) + __builtin_popcount(ups & 0x7f) > 7;
     // The registers the lowering needs for the program's length: one per uniform register no forwarding covers,
     // one for the uniform predicates when they are swapped through a register. The scratch block starts above them.
@@ -763,6 +887,238 @@ static void scratch_at(L *l, uint32_t i) {
         if (best_len >= NSCRATCH) break;
     }
     l->scratch_base = best, l->scratch_len = best_len > NSCRATCH ? NSCRATCH : best_len, l->nscratch = 0;
+}
+
+// ---- uniform register webs (liveness mode)
+//
+// A program that spreads over every general register leaves none dead over the whole life of a uniform register that
+// is defined several times (UR4:UR5 as a computed address early, another later). Each uniform register (a pair as one)
+// is split into webs: the reaching definitions of every read that needs the register are joined (union-find), and a
+// web's span runs from its first definition or read to its last, widened over loops (widen_span); a read reached by no
+// definition on some path joins the entry, which starts the span at 0. Each web gets a register (two adjacent ones for
+// a pair) dead over its span, chosen before lowering and marked live over the span so scratch and later webs keep off
+// it. A definition that reaches no register read writes nothing. Reads of either half of a pair join both halves'
+// definitions, so every instruction sees the two halves in one web's adjacent registers.
+static uint32_t uf_find(uint32_t *p, uint32_t x) { while (p[x] != x) x = p[x] = p[p[x]]; return x; }
+
+static int build_webs(L *l) {
+    if (!l->liveness || !l->leader) return 0;
+    uint32_t n = l->n;
+    uint32_t rows = 0, *row = calloc(n, sizeof *row);
+    if (!row) return 0;
+    for (uint32_t i = 0; i < n; i++) if (l->leader[i]) row[i] = ++rows;
+    // The reads that need the register, by the forwarding the lowering will use (bit 63 of rd[i]: none).
+    uint64_t *rd = calloc(n, sizeof *rd);
+    uint16_t *df = calloc((size_t)n * 64, sizeof *df);   // def numbering per instruction and register (+1)
+    l->web_rd = calloc((size_t)n * 64, sizeof *l->web_rd);
+    l->web_df = calloc((size_t)n * 64, sizeof *l->web_df);
+    int ok = rd && df && l->web_rd && l->web_df;
+    struct { uint8_t kind, bank; uint32_t value; } cur[64];
+    uint32_t ndef[64] = {0};
+    for (uint32_t i = 0; ok && i < n; i++) {
+        const Insn *x = &l->in[i];
+        if (l->leader[i]) fwd_enter(l, i, cur);
+        uint32_t reads[8][2];
+        int nr = ur_reads(x, reads);
+        for (int k = 0; k < nr; k++)
+            for (uint32_t c = 0; c < reads[k][1]; c++) {
+                uint32_t r = reads[k][0] + c;
+                if (r >= 63 || !l->needs_reg[r] || l->ur_def[r].kind != 3) continue;
+                if (cur[r].kind == 1 || cur[r].kind == 2) continue;
+                rd[i] |= 1ull << r;
+            }
+        int pair;
+        uint8_t kind, bank;
+        uint32_t value;
+        uint32_t w = ur_write(x, &pair, &kind, &bank, &value);
+        for (int k = 0; w < 63 && k <= pair && w + k < 63; k++)
+            if (l->needs_reg[w + k] && l->ur_def[w + k].kind == 3) {
+                if (ndef[w + k] >= 4000) ok = 0;
+                else df[(size_t)i * 64 + w + k] = (uint16_t)++ndef[w + k];
+            }
+        if (w < 63) {
+            cur[w].kind = kind, cur[w].bank = bank, cur[w].value = value;
+            if (pair && w + 1 < 63) cur[w + 1].kind = kind == 1 ? 1 : 3, cur[w + 1].bank = bank, cur[w + 1].value = value + 4;
+        }
+    }
+    // Union-find nodes: per entity (a single register, or the even register of a pair), its definitions of either half
+    // (numbered per register: node = base_e + (half ? ndef[e] : 0) + def - 1) and one entry node per half.
+    uint32_t ent[64], node0[64], nnodes = 0;
+    for (uint32_t r = 0; r < 63; r++) ent[r] = r;
+    for (uint32_t r = 0; r + 1 < 63; r += 2)
+        if (l->ur_pair[r] && l->needs_reg[r] && l->needs_reg[r + 1] && l->ur_def[r].kind == 3 && l->ur_def[r + 1].kind == 3)
+            ent[r + 1] = r;
+    for (uint32_t r = 0; r < 63; r++) {
+        node0[r] = nnodes;
+        nnodes += ndef[r] + 1;                                  // its definitions, then its entry node
+    }
+    uint32_t *par = ok ? malloc(nnodes * sizeof *par) : NULL;
+    uint8_t *used = ok ? calloc(nnodes, 1) : NULL;
+    uint32_t *first = ok ? malloc(nnodes * sizeof *first) : NULL, *last = ok ? malloc(nnodes * sizeof *last) : NULL;
+    ok = ok && par && used && first && last;
+    for (uint32_t k = 0; ok && k < nnodes; k++) par[k] = k, first[k] = UINT32_MAX, last[k] = 0;
+    // Reaching definitions, one register at a time: bitsets over its definitions plus the entry bit.
+    uint32_t t[72];
+    for (uint32_t r = 0; ok && r < 63; r++) {
+        if (!ndef[r] && !l->needs_reg[r]) continue;
+        uint32_t nb = ndef[r] + 1, words = (nb + 63) / 64, entry = ndef[r];
+        uint64_t *in = calloc((size_t)rows * words, 8), *curb = calloc(words, 8), *acc = calloc(words, 8);
+        uint8_t *dirty = calloc(rows, 1);
+        if (!in || !curb || !acc || !dirty) { ok = 0; free(in), free(curb), free(acc), free(dirty); break; }
+        in[entry / 64] |= 1ull << (entry % 64);                 // row 0 is the entry block
+        dirty[0] = 1;
+        for (int changed = 1, rounds = 0; changed && ok; rounds++) {
+            if (rounds > 10000) { ok = 0; break; }
+            changed = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                if (!l->leader[i] || !dirty[row[i] - 1]) continue;
+                dirty[row[i] - 1] = 0;
+                memcpy(curb, in + (size_t)(row[i] - 1) * words, words * 8);
+                uint32_t j = i;
+                for (;; j++) {
+                    uint32_t d = df[(size_t)j * 64 + r];
+                    if (d) {
+                        if (bits(&l->in[j], 12, 4) == 7) memset(curb, 0, words * 8);   // unconditional: kills the others
+                        curb[(d - 1) / 64] |= 1ull << ((d - 1) % 64);
+                    }
+                    if (j + 1 >= n || l->leader[j + 1]) break;
+                }
+                int ns = successors(l, j, t, 72);
+                if (ns < 0) { ok = 0; break; }
+                for (int q = 0; q < ns; q++) {
+                    if (t[q] >= n || !row[t[q]]) continue;
+                    uint64_t *dst = in + (size_t)(row[t[q]] - 1) * words;
+                    int moved = 0;
+                    for (uint32_t k = 0; k < words; k++)
+                        if (curb[k] & ~dst[k]) dst[k] |= curb[k], moved = 1;
+                    if (moved) dirty[row[t[q]] - 1] = 1, changed = 1;
+                }
+            }
+        }
+        // Every read of the register: join what reaches it, within its entity.
+        uint32_t e = ent[r];
+        for (uint32_t i = 0; ok && i < n; i++) {
+            if (l->leader[i]) memcpy(curb, in + (size_t)(row[i] - 1) * words, words * 8);
+            int reads_here = (rd[i] >> r & 1) || (ent[r] != r && (rd[i] >> e & 1)) || (ent[r] == r && r + 1 < 63 && ent[r + 1] == r && (rd[i] >> (r + 1) & 1));
+            (void)acc;
+            if (reads_here) {
+                // the reaching set of r at i joins one group; with a pair, both halves' groups join at any read of either
+                uint32_t anchor = UINT32_MAX;
+                for (uint32_t b = 0; b < nb; b++) {
+                    if (!(curb[b / 64] >> (b % 64) & 1)) continue;
+                    uint32_t node = node0[r] + b;
+                    used[node] = 1;
+                    if (i < first[node]) first[node] = i;
+                    if (i > last[node]) last[node] = i;
+                    if (anchor == UINT32_MAX) anchor = node;
+                    else par[uf_find(par, node)] = uf_find(par, anchor);
+                }
+                if (anchor != UINT32_MAX) {
+                    // remember this read's group for r (resolved to a web after all registers are joined)
+                    l->web_rd[(size_t)i * 64 + r] = (uint16_t)(anchor + 1 > 0xffff ? 0 : anchor + 1);
+                    if (anchor + 1 > 0xffff) ok = 0;
+                }
+            }
+            uint32_t d = df[(size_t)i * 64 + r];
+            if (d) {
+                uint32_t node = node0[r] + d - 1;
+                if (i < first[node]) first[node] = i;
+                if (i > last[node]) last[node] = i;
+                l->web_df[(size_t)i * 64 + r] = (uint16_t)(node + 1 > 0xffff ? 0 : node + 1);
+                if (node + 1 > 0xffff) ok = 0;
+                if (bits(&l->in[i], 12, 4) == 7) memset(curb, 0, words * 8);
+                curb[(d - 1) / 64] |= 1ull << ((d - 1) % 64);
+            }
+        }
+        free(in), free(curb), free(acc), free(dirty);
+    }
+    // A pair: the two halves' groups join at every instruction that reads either half (and at a pair definition).
+    for (uint32_t i = 0; ok && i < n; i++)
+        for (uint32_t r = 0; r + 1 < 63; r += 2) {
+            if (ent[r + 1] != r) continue;
+            uint32_t a = l->web_rd[(size_t)i * 64 + r], b = l->web_rd[(size_t)i * 64 + r + 1];
+            if (a && b) par[uf_find(par, b - 1)] = uf_find(par, a - 1);
+            a = l->web_df[(size_t)i * 64 + r], b = l->web_df[(size_t)i * 64 + r + 1];
+            if (a && b) par[uf_find(par, b - 1)] = uf_find(par, a - 1);
+        }
+    // Webs: the groups with a read. Spans and registers.
+    uint32_t *web_of = ok ? malloc(nnodes * sizeof *web_of) : NULL;
+    ok = ok && web_of;
+    for (uint32_t k = 0; ok && k < nnodes; k++) web_of[k] = UINT32_MAX;
+    for (uint32_t k = 0; ok && k < nnodes; k++) {
+        if (!used[k]) continue;
+        uint32_t root = uf_find(par, k);
+        if (web_of[root] == UINT32_MAX) {
+            void *grown = realloc(l->web, (l->nweb + 1) * sizeof *l->web);
+            if (!grown) { ok = 0; break; }
+            l->web = grown;
+            web_of[root] = l->nweb;
+            l->web[l->nweb].a = UINT32_MAX, l->web[l->nweb].b = 0, l->web[l->nweb].reg = 0, l->web[l->nweb].pair = 0;
+            l->web[l->nweb].base = 0;
+            l->nweb++;
+        }
+    }
+    // Every node's register, for the spans and the entity.
+    for (uint32_t r = 0; ok && r < 63; r++)
+        for (uint32_t b = 0; b <= ndef[r]; b++) {
+            uint32_t k = node0[r] + b, w = web_of[uf_find(par, k)];
+            if (w == UINT32_MAX || first[k] == UINT32_MAX) continue;
+            uint32_t a = b == ndef[r] ? 0 : first[k];          // the entry node: from the start
+            if (a < l->web[w].a) l->web[w].a = a;
+            if (last[k] > l->web[w].b) l->web[w].b = last[k];
+            l->web[w].base = (uint8_t)ent[r];
+            if (ent[r] != r || (r + 1 < 63 && ent[r + 1] == r)) l->web[w].pair = 1;
+        }
+    // Resolve the per-instruction groups to webs (0: a definition no register read reaches).
+    for (size_t q = 0; ok && q < (size_t)n * 64; q++) {
+        if (l->web_rd[q]) { uint32_t w = web_of[uf_find(par, l->web_rd[q] - 1u)]; l->web_rd[q] = (uint16_t)(w == UINT32_MAX ? 0 : w + 1); }
+        if (l->web_df[q]) { uint32_t w = web_of[uf_find(par, l->web_df[q] - 1u)]; l->web_df[q] = (uint16_t)(w == UINT32_MAX ? 0 : w + 1); }
+    }
+    // Registers: dead over the widened span (and the instruction before it), then live there. Spans first, then the
+    // webs in order of their start, first fit (interval colouring: what one web frees, a later one takes).
+    uint32_t *order = ok ? malloc((l->nweb + 1) * sizeof *order) : NULL;
+    ok = ok && order;
+    for (uint32_t w = 0; ok && w < l->nweb; w++) {
+        uint32_t a = l->web[w].a, b = l->web[w].b;
+        if (a > b) a = b;
+        widen_span(l, &a, &b);
+        l->web[w].a = a, l->web[w].b = b, order[w] = w;
+    }
+    for (uint32_t i = 1; ok && i < l->nweb; i++)             // insertion sort by start (a few dozen webs)
+        for (uint32_t j = i; j > 0 && l->web[order[j - 1]].a > l->web[order[j]].a; j--) {
+            uint32_t tmp = order[j]; order[j] = order[j - 1]; order[j - 1] = tmp;
+        }
+    for (uint32_t o = 0; ok && o < l->nweb; o++) {
+        uint32_t w = order[o], a = l->web[w].a, b = l->web[w].b;
+        uint32_t from = a ? a - 1 : 0;
+        uint64_t busy[4];
+        memcpy(busy, l->reserved, sizeof busy);
+        for (uint32_t i = from; i <= b && i < n; i++)
+            for (int k = 0; k < 4; k++) busy[k] |= l->live_out[i][k];
+        uint32_t width = l->web[w].pair ? 2 : 1, got = NOREG;
+        for (int pass = 0; pass < 2 && got == NOREG; pass++)     // a pair prefers an even first register
+            for (uint32_t c = 0; c + width <= 254 && got == NOREG; c++) {
+                if (width == 2 && pass == 0 && (c & 1)) continue;
+                int free_ = 1;
+                for (uint32_t k = 0; k < width; k++) if (busy[(c + k) / 64] >> ((c + k) % 64) & 1) free_ = 0;
+                if (free_) got = c;
+            }
+        if (got == NOREG) {
+            fail(l, width == 2 ? "no register pair dead over a uniform pair's web" : "no general register dead over a uniform register's web");
+            ok = 0;
+            break;
+        }
+        l->web[w].reg = (uint8_t)got, l->web[w].a = a, l->web[w].b = b;
+        for (uint32_t i = from; i <= b && i < n; i++)
+            for (uint32_t k = 0; k < width; k++) set_bit(l->live_out[i], got + k);
+    }
+    free(row), free(rd), free(df), free(par), free(used), free(first), free(last), free(web_of), free(order);
+    if (!ok) {
+        free(l->web_rd), free(l->web_df), free(l->web);
+        l->web_rd = l->web_df = NULL, l->web = NULL, l->nweb = 0;
+        return 0;
+    }
+    return 1;
 }
 
 // ---- operands
@@ -1877,12 +2233,12 @@ static void lower_tex(L *l, const Insn *x, uint32_t op) {
     if (dim == 6 || bits(x, 77, 1) || bits(x, 81, 3) != 7 || bits(x, 59, 1) != (op == 0x361 ? 1u : 0u) ||
         (lod > 3 && lod != 6 && lod != 7) || (dc && mask != 1) || mask == 0)
         return (void)fail(l, "TEX mode");
-    if (!bits(x, 60, 1) && op != 0x361) return (void)fail(l, "TEX unpacked operands");
     uint32_t coords = coord_count[dim];
     int has_lod = lod == 2 || lod == 3 || lod == 6 || lod == 7;
     uint32_t handle_slot = op == 0x361 ? 1 : 0;
     uint32_t count = coords + handle_slot + has_lod + offsets + dc;
-    uint32_t in_a = op == 0x361 && !bits(x, 60, 1) ? coords : count <= 4 ? (count + 1) / 2 : op == 0x361 ? coords : 4;
+    // Unpacked operands (bit 60 clear): the coordinates fill Ra.., everything else starts at Rb, as TEX.B's are read.
+    uint32_t in_a = !bits(x, 60, 1) ? coords : count <= 4 ? (count + 1) / 2 : op == 0x361 ? coords : 4;
     uint32_t tid = bits(x, 40, 14), bank = bits(x, 54, 5);
     uint32_t v[8];
     for (uint32_t i = 0; i < count && i < 8; i++)
@@ -2307,7 +2663,10 @@ static void lower_plop3_any(L *l, const Insn *x, int uniform) {
     }
     if (pd == 7) return;
     uint32_t in[3] = {a, b, c};
-    if (!plop3_psetp(l, pd, lut, in)) (void)fail(l, "PLOP3 table");
+    // Tables no single PSETP ((a op b) op2 c with negations) computes, such as a majority or a 3-input XOR with a
+    // mixed term: the table on registers (the inputs are ordinary predicates by now).
+    static const int none[3] = {0, 0, 0};
+    if (!plop3_psetp(l, pd, lut, in)) plop3_table_regs(l, pd, lut, in, none, RZ);
 }
 static void lower_plop3(L *l, const Insn *x) { lower_plop3_any(l, x, 0); }
 
@@ -2328,6 +2687,71 @@ static void lower_shfl(L *l, const Insn *x, uint32_t op) {
         emit(l, base(l, 0xef10000000000000ull, rd, ra) | ((uint64_t)bits(x, 53, 5) << 20) | ((uint64_t)1 << 28) |
                     ((uint64_t)mode << 30) | ((uint64_t)bits(x, 64, 8) << 39) | ((uint64_t)pout << 48));
     }
+}
+
+// MATCH (0x3a1; Mesa NAK sm70_encode.rs, OpMatch): mask Rd 16-23, value Ra 24-31 (Ra, Ra + 1 with .U64, bit 73),
+// .ANY at bit 79 (else .ALL), predicate output 81-83 (.ALL only). Maxwell has no MATCH; it is built from VOTE, SHFL
+// and ISETP over the lanes the instruction's guard leaves active:
+// - .ALL: the value of one active lane (the highest, FLO of the active ballot) is shuffled to every lane and
+//   compared; Pd = VOTE.ALL of the comparison, Rd = the active ballot when it holds, else 0.
+// - .ANY: Rd = the active lanes holding the same value as this one. Every lane's value is shuffled in turn, from
+//   lane 31 down, and the comparison is shifted into an accumulator. The comparison needs a predicate the
+//   instruction does not name: PR is saved (P2R) and restored (R2P) around it.
+static void lower_match(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), wide = bits(x, 73, 1), any = bits(x, 79, 1), pd = bits(x, 81, 3);
+    if (x->w[1] || (x->w[2] & ~((1u << 9) | (1u << 15) | (7u << 17)))) return (void)fail(l, "MATCH mode");
+    if (wide && (ra == RZ || ra % 2)) return (void)fail(l, "MATCH.U64 register");
+    uint32_t guard = (uint32_t)(l->pred >> 16) & 7;
+    uint32_t active = S(l, 0), v = S(l, 1), t = S(l, 2);
+    if (l->failed) return;
+    // VOTE.ANY active, PT, PT: the ballot of the lanes running this instruction.
+    emit(l, 0x50d8000000000000ull | l->pred | active | (7ull << 39) | (7ull << 45) | (1ull << 48));
+    if (!any) {
+        if (pd == 7 && rd == RZ) return;
+        uint32_t q = pd;
+        uint32_t save = RZ;
+        if (q == 7) {                                         // Rd only: a borrowed predicate, as for .ANY
+            save = S(l, 3);
+            if (l->failed) return;
+            q = guard == 0 ? 1 : 0;
+            emit(l, 0x38e8000000070000ull | save | ((uint64_t)RZ << 8) | ((uint64_t)0x7f << 20));   // P2R save, PR, RZ, 0x7f
+        }
+        emit(l, base(l, 0x5c30000000000000ull, t, 0) | ((uint64_t)active << 20));                    // FLO.U32 t, active
+        emit(l, base(l, 0xef10000000000000ull, v, ra) | ((uint64_t)t << 20) | (1ull << 29) | (0x1full << 34) | (7ull << 48));   // SHFL.IDX v, PT, ra, t, 0x1f
+        emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)q << 3) | ((uint64_t)v << 8) | ((uint64_t)ra << 20) |
+                    (7ull << 39) | (2ull << 49));                                                     // ISETP.EQ.AND q, PT, v, ra, PT
+        if (wide) {
+            emit(l, base(l, 0xef10000000000000ull, v, ra + 1) | ((uint64_t)t << 20) | (1ull << 29) | (0x1full << 34) | (7ull << 48));
+            emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)q << 3) | ((uint64_t)v << 8) | ((uint64_t)(ra + 1) << 20) |
+                        ((uint64_t)q << 39) | (2ull << 49));                                          // ISETP.EQ.AND q, PT, v, ra+1, q
+        }
+        emit(l, 0x50d8000000000000ull | l->pred | RZ | ((uint64_t)q << 39) | ((uint64_t)q << 45));    // VOTE.ALL RZ, q, q
+        if (rd != RZ)
+            emit(l, base(l, 0x5ca0000000000000ull, rd, active) | ((uint64_t)RZ << 20) | ((uint64_t)q << 39));   // SEL rd, active, RZ, q
+        if (save != RZ) emit(l, 0x38f0000000070000ull | ((uint64_t)save << 8) | ((uint64_t)0x7f << 20));      // R2P PR, save, 0x7f
+        return;
+    }
+    if (pd != 7) return (void)fail(l, "MATCH.ANY with a predicate");
+    if (rd == RZ) return;
+    uint32_t acc = S(l, 3), save = S(l, 4);
+    if (l->failed) return;
+    uint32_t q = guard == 0 ? 1 : 0;
+    emit(l, 0x38e8000000070000ull | save | ((uint64_t)RZ << 8) | ((uint64_t)0x7f << 20));           // P2R save, PR, RZ, 0x7f
+    mov_imm(l, acc, 0);
+    for (int lane = 31; lane >= 0; lane--) {
+        emit(l, base(l, 0xef10000000000000ull, v, ra) | ((uint64_t)lane << 20) | (1ull << 28) | (1ull << 29) | (0x1full << 34) | (7ull << 48));
+        emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)q << 3) | ((uint64_t)v << 8) | ((uint64_t)ra << 20) |
+                    (7ull << 39) | (2ull << 49));
+        if (wide) {
+            emit(l, base(l, 0xef10000000000000ull, v, ra + 1) | ((uint64_t)lane << 20) | (1ull << 28) | (1ull << 29) | (0x1full << 34) | (7ull << 48));
+            emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)q << 3) | ((uint64_t)v << 8) | ((uint64_t)(ra + 1) << 20) |
+                        ((uint64_t)q << 39) | (2ull << 49));
+        }
+        emit(l, base(l, 0x38a0000000000000ull, t, RZ) | (1ull << 20) | ((uint64_t)q << 39) | (1ull << 42));   // SEL t, RZ, 1, !q
+        emit(l, base(l, 0x5c18000000000000ull, acc, acc) | ((uint64_t)t << 20) | (1ull << 39));               // ISCADD acc, acc, t, 1
+    }
+    emit(l, base(l, 0x5be0000000000000ull, rd, acc) | ((uint64_t)active << 20) | (0xc0ull << 28) | ((uint64_t)RZ << 39));   // LOP3 rd = acc & active
+    emit(l, 0x38f0000000070000ull | ((uint64_t)save << 8) | ((uint64_t)0x7f << 20));                // R2P PR, save, 0x7f
 }
 
 // VOTE (0x806): ballot into Rd, predicate output 81-83 (all/any/eq by 72-73), input 87-90.
@@ -2451,8 +2875,8 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
     }
     case 0x082:                                               // UMOV: register (0xc82, UR at 32-37) or immediate (0x882)
         if (bits(x, 16, 8) == 63 || !ur_has_reg(l, bits(x, 16, 8))) return;   // URZ, or every use forwards
-        if (op == 0x882) return mov_imm(l, ur(l, bits(x, 16, 8)), x->w[1]);
-        if (op == 0xc82) return mov_reg(l, ur(l, bits(x, 16, 8)), ur_in(l, bits(x, 32, 6), 5));
+        if (op == 0x882) return mov_imm(l, ur_dst(l, bits(x, 16, 8)), x->w[1]);
+        if (op == 0xc82) { uint32_t src = ur_in(l, bits(x, 32, 6), 5); return mov_reg(l, ur_dst(l, bits(x, 16, 8)), src); }
         return (void)fail(l, "UMOV form");
     case 0x085: plain = 0x017; has_c = 0; break;
     case 0x090: plain = 0x010; break;
@@ -2474,7 +2898,7 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
     if (plain == 0x025) {                                     // a pair: both registers, or neither (dropped)
         if (!ur_has_reg(l, dst) && !ur_has_reg(l, dst + 1) && bits(x, 81, 6) == 0x3f) return;
         if (!ur_has_reg(l, dst) || !ur_has_reg(l, dst + 1)) return (void)fail(l, "uniform pair half without a register");
-        if (ur(l, dst + 1) != ur(l, dst) + 1) {
+        if (ur_dst(l, dst + 1) != ur_dst(l, dst) + 1) {
 #ifdef SM86_TOOL
             if (getenv("SM86_POOL"))
                 fprintf(stderr, "pair UR%u: map %u %u pair flags %u %u needs %u %u ur_next %u scratch_base %u\n", dst, l->ur_map[dst],
@@ -2614,6 +3038,25 @@ static void lower_atomg(L *l, const Insn *x, uint32_t op) {
     }
     emit(l, 0xed00000000000000ull | l->pred | rd | ((uint64_t)address << 8) | ((uint64_t)data << 20) |
                 ((uint64_t)((uint32_t)offset & 0xfffff) << 28) | ((uint64_t)1 << 48) | ((uint64_t)operation << 52));
+}
+
+// ATOMG.CAS (0x3a9; Mesa NAK sm70_encode.rs, OpAtom with AtomOp::CmpExch): address pair 24-31 (64-bit at 72), compare
+// 32-39, offset 40-63, new value 64-71, 32-bit only here (size 73-75 zero). Maxwell ATOM.CAS (0xeef, Ryujinx InstAtomCas:
+// address 8-15, .E 48, compare Rb at 20-27 and the new value in Rb + 1; translator patch 0028) has no offset: the
+// game's CAS loops use none.
+static void lower_atomg_cas(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), address = bits(x, 24, 8), cmp = bits(x, 32, 8), value = bits(x, 64, 8);
+    if ((x->w[2] & ~0xffu) != 0x001ee100u || bits(x, 40, 24) || (address & 1) || address == RZ)
+        return (void)fail(l, "ATOMG.CAS mode");
+    uint32_t pair = cmp;
+    if (cmp == RZ || value != cmp + 1) {                       // compare and new value adjacent, in scratch when not
+        pair = S(l, 0);
+        uint32_t hi = S(l, 1);
+        if (l->failed) return;
+        if (cmp == RZ) mov_imm(l, pair, 0); else mov_reg(l, pair, cmp);
+        if (value == RZ) mov_imm(l, hi, 0); else mov_reg(l, hi, value);
+    }
+    emit(l, 0xeef0000000000000ull | l->pred | rd | ((uint64_t)address << 8) | ((uint64_t)pair << 20) | ((uint64_t)1 << 48));
 }
 
 // TXQ (0xb6f, bound; 0x370 TXQ.B): texture dimensions of the level in Ra; mask 72-75, second destination 64-71.
@@ -2946,7 +3389,15 @@ static void lower_one_inner(L *l, const Insn *x);
 // The register of the uniform predicates in swap mode (bit n = UPn), made on first use.
 static uint32_t up_register(L *l) {
     if (!l->up_reg) {
-        l->up_reg = l->liveness && l->ur_next >= l->scratch_base ? alloc_dead(l, 0, l->n - 1) : alloc_gpr(l);
+        if (l->liveness && l->ur_next >= l->scratch_base) {
+            // Dead over the instructions that name a uniform predicate (widened over loops), not the whole program: a
+            // program that spreads over every register still leaves some dead around its uniform predicates' uses.
+            uint32_t a = l->up_first ? l->up_first - 1 : 0, b = l->up_last ? l->up_last - 1 : l->n - 1;
+            widen_span(l, &a, &b);
+            l->up_reg = alloc_dead(l, a, b);
+        } else {
+            l->up_reg = alloc_gpr(l);
+        }
         if (l->up_reg == NOREG) return fail(l, "no general register free for the uniform predicates"), NOREG;
     }
     return l->up_reg;
@@ -2956,13 +3407,11 @@ static uint32_t up_register(L *l) {
 // cannot hold both in Pn; the level's tile loops test P0 against UP0): the table on registers. P2R copies the
 // ordinary predicates out, up_reg holds the uniform ones; each input's bit is shifted to bit pd, one LOP3 applies the
 // table (negations and PT inputs folded into it), R2P writes bit pd into Pd under the instruction's guard.
-static void lower_plop3_regs(L *l, const Insn *x) {
-    uint32_t pd = bits(x, 81, 3), pd2 = bits(x, 84, 3), lut = bits(x, 64, 3) | (bits(x, 72, 5) << 3);
-    if (pd2 != 7 || bits(x, 16, 8) || x->w[1]) return (void)fail(l, "PLOP3 mode");
-    if (pd == 7) return;
-    uint32_t in[3] = {bits(x, 87, 4), bits(x, 77, 4), bits(x, 68, 4)};
-    int uni[3] = {0, 0, (int)bits(x, 67, 1)};
-    uint32_t pr = S(l, 0), upr = uni[2] ? up_register(l) : RZ, r[3];
+// Pd = LUT(in[0], in[1], in[2]) on registers. in[i] is a predicate number with bit 3 negating it; uni[i] reads it
+// from upr (the uniform predicates' register in swap mode) instead of the ordinary predicates P2R copies out.
+static void plop3_table_regs(L *l, uint32_t pd, uint32_t lut, const uint32_t in_[3], const int uni[3], uint32_t upr) {
+    uint32_t in[3] = {in_[0], in_[1], in_[2]};
+    uint32_t pr = S(l, 0), r[3];
     if (l->failed) return;
     emit(l, 0x38e8000000070000ull | pr | ((uint64_t)RZ << 8) | ((uint64_t)0x7f << 20));   // P2R pr, PR, RZ, 0x7f
     for (int i = 0; i < 3; i++) {
@@ -2987,6 +3436,21 @@ static void lower_plop3_regs(L *l, const Insn *x) {
     emit(l, base(l, 0x5be0000000000000ull, t, r[0]) | ((uint64_t)r[1] << 20) | ((uint64_t)lut << 28) |
                 ((uint64_t)r[2] << 39) | ((uint64_t)7 << 48));
     emit(l, 0x38f0000000000000ull | l->pred | ((uint64_t)t << 8) | ((uint64_t)(1u << pd) << 20));   // R2P PR, t, 1 << pd
+}
+
+// PLOP3 in swap mode when an ordinary input has the number of a uniform predicate the instruction names (the swap
+// cannot hold both in Pn; the level's tile loops test P0 against UP0): the table on registers. P2R copies the
+// ordinary predicates out, up_reg holds the uniform ones; each input's bit is shifted to bit pd, one LOP3 applies the
+// table (negations and PT inputs folded into it), R2P writes bit pd into Pd under the instruction's guard.
+static void lower_plop3_regs(L *l, const Insn *x) {
+    uint32_t pd = bits(x, 81, 3), pd2 = bits(x, 84, 3), lut = bits(x, 64, 3) | (bits(x, 72, 5) << 3);
+    if (pd2 != 7 || bits(x, 16, 8) || x->w[1]) return (void)fail(l, "PLOP3 mode");
+    if (pd == 7) return;
+    uint32_t in[3] = {bits(x, 87, 4), bits(x, 77, 4), bits(x, 68, 4)};
+    int uni[3] = {0, 0, (int)bits(x, 67, 1)};
+    uint32_t upr = uni[2] ? up_register(l) : RZ;
+    if (l->failed) return;
+    plop3_table_regs(l, pd, lut, in, uni, upr);
 }
 
 static void lower_one(L *l, const Insn *x) {
@@ -3106,11 +3570,13 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x984: case 0x388: case 0x988: return lower_lds_sts(l, x, op);
     case 0x98e: return lower_red(l, x);
     case 0x3a8: case 0x9a8: return lower_atomg(l, x, op);
+    case 0x3a9: return lower_atomg_cas(l, x);
     case 0x227: case 0x827: case 0xa27: return lower_imad_hi(l, x);
     case 0x213: case 0x813: case 0xa13: return lower_iabs(l, x);   // register, immediate, constant b
     case 0x803: return lower_p2r_r2p(l, x, 0);
     case 0x804: return lower_p2r_r2p(l, x, 1);
     case 0x81c: return lower_plop3(l, x);
+    case 0x3a1: return lower_match(l, x);
     case 0xf89: case 0x589: case 0x989: return lower_shfl(l, x, op);
     case 0x806: return lower_vote(l, x);
     case 0x822: return lower_fswzadd(l, x);
@@ -3238,6 +3704,24 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         // No room above the program's registers: scratch comes from the registers dead at each instruction.
         l.liveness = compute_liveness(&l);
         if (!l.liveness) free(l.live_out), l.live_out = NULL;
+        // Spans of the uniform registers that need one: from the first definition (0 when read before any) to the
+        // last read of the register, both halves of a pair together, widened over loops.
+        for (uint32_t n = 0; l.liveness && n < 63; n++) {
+            if (!l.needs_reg[n]) continue;
+            uint32_t a = l.ur_whole[n] || !l.ur_first[n] ? 0 : l.ur_first[n] - 1;
+            uint32_t b = l.ur_last[n] ? l.ur_last[n] - 1 : l.n - 1;
+            uint32_t m = n ^ 1;
+            if (l.ur_pair[n] && m < 63 && l.needs_reg[m]) {
+                uint32_t a2 = l.ur_whole[m] || !l.ur_first[m] ? 0 : l.ur_first[m] - 1;
+                uint32_t b2 = l.ur_last[m] ? l.ur_last[m] - 1 : l.n - 1;
+                if (a2 < a) a = a2;
+                if (b2 > b) b = b2;
+            }
+            if (b < a) b = a;
+            widen_span(&l, &a, &b);
+            l.span_a[n] = a, l.span_b[n] = b, l.span_ok[n] = 1;
+        }
+        l.webs = build_webs(&l);
     }
     if (sm86_probe_match(code, code_size)) {
         if (l.liveness || l.scratch_base + NSCRATCH > PROBE_REG + 1 - (uint32_t)(probe_spec.n ? probe_spec.n : 1))
@@ -3261,7 +3745,7 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
     }
     for (l.index = 0; l.index < l.n && !l.failed; l.index++) {
         l.first_out[l.index] = l.nout;
-        if (l.leader && l.leader[l.index]) memset(l.cur_def, 0, sizeof l.cur_def);
+        if (l.leader && l.leader[l.index]) fwd_enter(&l, l.index, l.cur_def);
         if (l.liveness) scratch_at(&l, l.index);
         lower_one(&l, &l.in[l.index]);
         for (int k = 0; l.probe && k < probe_spec.nreach; k++)   // OOT_PROBE_REACH: bit k, unconditionally
@@ -3348,6 +3832,6 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         out->error_offset = header + l.error_index * 16;
         sm86_lower_free(out);
     }
-    free(l.out), free(l.first_out), free(l.reloc), free(l.leader), free(l.live_out);
+    free(l.out), free(l.first_out), free(l.reloc), free(l.leader), free(l.live_out), free(l.fwd_slot), free(l.fwd_in), free(l.web_rd), free(l.web_df), free(l.web);
     return !l.failed;
 }

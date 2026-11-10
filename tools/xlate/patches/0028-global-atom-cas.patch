@@ -1,0 +1,42 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmit.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmit.cs
+@@ -8,13 +8,6 @@
+ {
+     static partial class InstEmit
+     {
+-        public static void AtomCas(EmitterContext context)
+-        {
+-            context.GetOp<InstAtomCas>();
+-
+-            context.TranslatorContext.GpuAccessor.Log("Shader instruction AtomCas is not implemented.");
+-        }
+-
+         public static void AtomsCas(EmitterContext context)
+         {
+             context.GetOp<InstAtomsCas>();
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
+@@ -20,6 +20,23 @@
+             Operand value = GetSrcReg(context, op.SrcB);
+ 
+             Operand res = EmitAtomicOp(context, StorageKind.GlobalMemory, op.Op, op.Size, addrLow, addrHigh, value);
++
++            context.Copy(GetDest(op.Dest), res);
++        }
++
++        // ATOM.CAS: 32-bit compare-and-swap on global memory at [Ra] (.E: a 64-bit address in Ra, Ra + 1); compares with
++        // Rb and stores Rb + 1 when equal; Rd gets the old value. The SM86 lowering (sm86_lower.c lower_atomg_cas) emits
++        // it with BcRz 0 and no offset.
++        public static void AtomCas(EmitterContext context)
++        {
++            InstAtomCas op = context.GetOp<InstAtomCas>();
++
++            (Operand addrLow, Operand addrHigh) = Get40BitsAddress(context, new Register(op.SrcA, RegisterType.Gpr), op.E, 0);
++
++            Operand compare = GetSrcReg(context, op.SrcB);
++            Operand value = GetSrcReg(context, op.SrcB == RegisterConsts.RegisterZeroIndex ? op.SrcB : op.SrcB + 1);
++
++            Operand res = context.AtomicCompareAndSwap(StorageKind.GlobalMemory, addrLow, addrHigh, compare, value);
+ 
+             context.Copy(GetDest(op.Dest), res);
+         }

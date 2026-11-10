@@ -56,10 +56,12 @@
 #define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 30                                      // in every cache key; bump when the key layout or the use of the
+#define KEY_VERSION 31                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids;
                                                            // 5: NVN2 programs; 30: HMMA on 16x16x16 matrices, sm86_lower.c
-                                                           // marker bit 48); translator changes are covered by its identity
+                                                           // marker bit 48; 31: sm86_lower.c forwarding across blocks,
+                                                           // uniform register webs, MATCH, PLOP3 tables, ATOMG.CAS);
+                                                           // translator changes are covered by its identity
 #define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
                                                            // or the program hash changes (drops every stored input;
                                                            // 2: the control section's own size, the whole code block)
