@@ -1307,10 +1307,10 @@ static int copy_ranges(VkCommandBuffer cb, MRange *a, int n, int to_mirror, uint
             mregions[k++] = (VkBufferCopy){lo, lo, hi - lo};
         }
         if (!k) continue;
+        for (int j = 0; j < k; j++) *bytes += mregions[j].size;
         if (to_mirror) vkCmdCopyBuffer(cb, r->buf, r->mbuf, (uint32_t)k, mregions);
         else vkCmdCopyBuffer(cb, r->mbuf, r->buf, (uint32_t)k, mregions);
         rec++;
-        for (int j = 0; j < k; j++) *bytes += mregions[j].size;
         *copies += (uint64_t)k;
     }
     return rec;
@@ -1465,6 +1465,15 @@ static void mirror_sync(PoolRec *r) {
         a = a > lo ? a & ~0xfffull : lo;
         b = b < hi ? (b + 0xfff) & ~0xfffull : hi;
         if (a < b) range_add(&pend, &npend, &cpend, r, a - lo, b - a);
+    }
+    {   // readback ranges (vk_exec_draw.c): guest memory as the CPU left it, whether or not a page counts as written
+        static uint64_t rb[512][2];   // replay thread only
+        int n = vk_readback_ranges(lo, hi, rb, 512);
+        for (int i = 0; i < n; i++) {
+            uint64_t a = rb[i][0] & ~3ull, b = (rb[i][1] + 3) & ~3ull;
+            if (b > hi) b = hi;
+            if (a < b) range_add(&pend, &npend, &cpend, r, a - lo, b - a);
+        }
     }
     mrep.syncs++;
     mrep.sync_t += qpc() - t0;

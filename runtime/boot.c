@@ -429,7 +429,10 @@ static void series_shot(const tex_t *t, uint64_t n) {
 static uint64_t frame_sync_fence;   // frame_sync 3: the last present's newest submit, waited for by the next submit
 static int frame_sync_mode(void) {
     static int mode = -1;
-    if (mode < 0) mode = cfg_get("OOT_FRAME_SYNC") ? atoi(cfg_get("OOT_FRAME_SYNC")) : 0;
+    // Default 2: in Link's house, standing still, 41 of 117 samples were unlit with no waits at all, 13 with the
+    // readback ranges alone, 0 with 2 or 3; 2 cost no frame rate there (20.0 fps against 19.4, 3: 17.6; 2026-11-10,
+    // build/logs/house.sh). What the game or the replay reads too early is not found yet.
+    if (mode < 0) mode = cfg_get("OOT_FRAME_SYNC") ? atoi(cfg_get("OOT_FRAME_SYNC")) : 2;
     return mode;
 }
 void frame_sync_before_submit(void) {

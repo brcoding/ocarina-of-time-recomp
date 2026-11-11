@@ -56,7 +56,7 @@
 #define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 31                                      // in every cache key; bump when the key layout or the use of the
+#define KEY_VERSION 32                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids;
                                                            // 5: NVN2 programs; 30: HMMA on 16x16x16 matrices, sm86_lower.c
                                                            // marker bit 48; 31: sm86_lower.c forwarding across blocks,
@@ -1283,9 +1283,9 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         sep = "";
         o += sprintf(o, "},\"img\":{");
         for (int i = 0; i < 32; i++)
-            if (a->img_type[i] && a->img_type[i] < COUNT(tex_names)) {
+            if ((a->img_type[i] & 0xf) && (a->img_type[i] & 0xf) < COUNT(tex_names)) {   // the integer flags are in img_format
                 const char *f = a->img_format[i] && a->img_format[i] < COUNT(fmt_names) ? fmt_names[a->img_format[i]] : "R8G8B8A8Unorm";
-                o += sprintf(o, "%s\"%d\":{\"type\":\"%s\",\"fmt\":\"%s\"}", sep, i, tex_names[a->img_type[i]], f), sep = ",";
+                o += sprintf(o, "%s\"%d\":{\"type\":\"%s\",\"fmt\":\"%s\"}", sep, i, tex_names[a->img_type[i] & 0xf], f), sep = ",";
             }
         sep = "";
         o += sprintf(o, "},\"attr\":{");
@@ -1309,6 +1309,13 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         if (a && (a->local[0] | a->local[1] | a->local[2])) l[0] = a->local[0], l[1] = a->local[1], l[2] = a->local[2];
         else for (int k = 0; k < 3; k++) l[k] = ctl->local[k] ? ctl->local[k] : 1;
         o += sprintf(o, ",\"local\":[%u,%u,%u]", l[0], l[1], l[2]);
+        // NVN2: where bank 0 holds the kernel's texture and image handles, so the translator can ask for their types
+        // by slot (tools/xlate/Program.cs TexSlot). Without it every such handle was a float 2D texture or image: the
+        // end-of-frame kernel 3ce2b98c stored its packed square-rooted colour through a float image into the R32UI
+        // view the game binds, the driver dropped the stores, and the upscaler squared the plain colour (crushed
+        // shadows, blown highlights, an orange cast; 2026-11-10, build/logs/dump-79 pass 250 equal to pass 230).
+        if (ctl->ntex || ctl->nimg)
+            o += sprintf(o, ",\"nvn2\":{\"tex\":%u,\"ntex\":%u,\"img\":%u,\"nimg\":%u}", ctl->tab_tex, ctl->ntex, ctl->tab_img, ctl->nimg);
     }
     /* Switch 1's control byte +0x718 bit 0 was the driver's early-Z-force (MacNativeGames ae8f4f4: without it a
        shader that stores to memory is depth-tested late, and the G-buffer draws' EQUAL test after the depth prepass

@@ -1130,6 +1130,23 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
         if (!p) rt_fatal("vk: out of memory for texture slot tokens");
         __atomic_store_n(&sinfo, p, __ATOMIC_RELEASE);
     }
+    {   // OOT_TEX_WATCH=<address> (diagnostic): every distinct registration of a texture stored there
+        static uint64_t watch = 1;
+        if (watch == 1) { const char *e = getenv("OOT_TEX_WATCH"); watch = e && *e ? strtoull(e, NULL, 0) : 0; }
+        TexKey wk;
+        if (watch && (make_key(t, &wk), wk.addr == watch)) {
+            static struct { uint32_t f, vf; } seen[32];
+            static int nseen;
+            uint32_t f = (uint32_t)t->d.format, vf = v && v->set_format ? (uint32_t)v->format : 0;
+            int k = 0;
+            for (; k < nseen; k++) if (seen[k].f == f && seen[k].vf == vf) break;
+            if (k == nseen && nseen < 32) {
+                seen[nseen].f = f, seen[nseen++].vf = vf;
+                rt_log("vk: OOT_TEX_WATCH: id %d registered at %#llx: nvn format %#x, view format %#x, %ux%u", id,
+                       (unsigned long long)watch, f, vf, (unsigned)t->d.width, (unsigned)t->d.height);
+            }
+        }
+    }
     TexSlot *s = &tslots[id];
     s->t = *t;
     s->used = 1;
@@ -1180,6 +1197,18 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
             view->set_swizzle = 1;
             *has_view = 1;
         }
+    }
+    // And the slot descriptor's format: the game describes one storage as R11G11B10F (the scene's render target), as
+    // RGB9E5 (what the upscaler samples) and as RGB9E5 with an R32UI view (what the end-of-frame kernel 3ce2b98c
+    // stores its packed texels through). Every one of them follows the render target's image; sampled in that image's
+    // format, the RGB9E5 words read as R11G11B10F (a black picture with coloured specks, 2026-11-10). The view takes
+    // the descriptor's format; vk_exec_draw.c reinterpret_format makes the image view when the texel sizes match.
+    if (e && !(s->has_view && s->v.set_format) && s->t.d.format != e->t.d.format && s->t.d.width == e->t.d.width &&
+        s->t.d.height == e->t.d.height) {
+        if (!*has_view) memset(view, 0, sizeof *view);
+        view->format = s->t.d.format;
+        view->set_format = 1;
+        *has_view = 1;
     }
     return e;
 }

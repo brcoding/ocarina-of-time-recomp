@@ -292,8 +292,99 @@ int vk_gpu_wrote_pages(uint64_t addr, uint64_t size) {
     return 0;
 }
 
+// Readback ranges: buffers a shader writes that the CPU reads back and then writes itself. The game's exposure meter is
+// one: a pass adds the frame's light into it, the CPU reads the sums after an invalidate and stores 0 back. Guest
+// memory is the console's one copy of it; here the GPU adds into the pool's mirror, and three things keep the two
+// apart (Hookshot found the same and describes it in gpu/vk/vk_memory.cpp, read for behaviour only):
+// - the CPU reads before the submission that wrote the range has written it back: guest_read waits for that
+//   submission (vk_readback_fence), not for everything submitted;
+// - the write-back then lands over the 0 the CPU stored meanwhile, and the next frame adds onto the old sum;
+// - a submission recorded before the CPU's store syncs nothing (the page was not dirty yet) and adds onto the
+//   mirror's old sum: the mirror takes these ranges from guest memory at every submission's first use of the pool
+//   (vk_memory.c mirror_sync), on the GPU, so the pass adds to what the CPU left by then.
+// The exposure stepped for a few frames (black or unlit pictures whenever bright effects were in view) until every
+// frame waited for the GPU (OOT_FRAME_SYNC=3). OOT_READBACK_SYNC=0: none of this.
+enum { RB_N = 512, RB_EXPIRE = 1800 };
+static struct { uint64_t lo, hi, fence, seen; } rb_r[RB_N];
+static int rb_n;
+static SRWLOCK rb_lock = SRWLOCK_INIT;
+static int rb_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = cfg_get("OOT_READBACK_SYNC"); on = e && *e ? atoi(e) : 1; }   // 2: the 64-byte results too
+    return on;
+}
+int vk_readback_note(uint64_t addr, uint64_t size) {
+    // Not the 64-byte counter and query results the game polls every frame (dozens of them: waiting for each one's
+    // submission serialised the frame, 19 -> 8 fps on the recorded route).
+    if (!rb_on() || (size <= 0x40 && rb_on() < 2) || size > (uint64_t)GW_MAX_PAGES << 12) return 0;
+    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    AcquireSRWLockExclusive(&rb_lock);
+    int i = 0, old = -1;
+    for (; i < rb_n; i++) {
+        if (rb_r[i].lo == addr && rb_r[i].hi == addr + size) break;
+        if (now - rb_r[i].seen > RB_EXPIRE) old = i;
+    }
+    if (i == rb_n) {
+        if (old >= 0) i = old;
+        else if (rb_n < RB_N) i = rb_n++;
+        else i = -1;
+        if (i >= 0) {
+            rb_r[i].lo = addr, rb_r[i].hi = addr + size, rb_r[i].fence = 0;
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 24)
+                rt_log("vk: readback range %#llx+%#llx: waited for, and refreshed in its pool's mirror at every submission",
+                       (unsigned long long)addr, (unsigned long long)size);
+        }
+    }
+    if (i >= 0) rb_r[i].seen = now;
+    ReleaseSRWLockExclusive(&rb_lock);
+    return i >= 0;
+}
+uint64_t vk_readback_fence(uint64_t addr, uint64_t size) {
+    uint64_t f = 0;
+    AcquireSRWLockShared(&rb_lock);
+    for (int i = 0; i < rb_n; i++)
+        if (rb_r[i].lo < addr + size && addr < rb_r[i].hi && rb_r[i].fence > f) f = rb_r[i].fence;
+    ReleaseSRWLockShared(&rb_lock);
+    return f;
+}
+int vk_readback_ranges(uint64_t lo, uint64_t hi, uint64_t out[][2], int cap) {
+    int n = 0;
+    if (!rb_n) return 0;
+    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    AcquireSRWLockShared(&rb_lock);
+    for (int i = 0; i < rb_n && n < cap; i++)
+        if (rb_r[i].lo >= lo && rb_r[i].hi <= hi && now - rb_r[i].seen <= RB_EXPIRE) out[n][0] = rb_r[i].lo, out[n][1] = rb_r[i].hi, n++;
+    ReleaseSRWLockShared(&rb_lock);
+    return n;
+}
+static void rb_written(uint64_t addr, uint64_t size, uint64_t fence) {
+    if (!rb_n) return;
+    AcquireSRWLockExclusive(&rb_lock);
+    for (int i = 0; i < rb_n; i++)
+        if (rb_r[i].lo < addr + size && addr < rb_r[i].hi && fence > rb_r[i].fence) rb_r[i].fence = fence;
+    ReleaseSRWLockExclusive(&rb_lock);
+}
+
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
+    // OOT_WB_WATCH=<address> (diagnostic): the written ranges that cover it, with the program that wrote (first 40
+    // distinct ones); for finding a write-back that lands over data the CPU wrote.
+    static uint64_t watch = 1;
+    if (watch == 1) { const char *e = getenv("OOT_WB_WATCH"); watch = e && *e ? strtoull(e, NULL, 0) : 0; }
+    if (watch && addr <= watch && watch - addr < size) {
+        static struct { uint64_t a, n, prog; } seen[40];
+        static int nseen;
+        uint64_t prog = ex->prog ? ex->prog->serial : 0;
+        int k = 0;
+        for (; k < nseen; k++) if (seen[k].a == addr && seen[k].n == size && seen[k].prog == prog) break;
+        if (k == nseen && nseen < 40) {
+            seen[nseen].a = addr, seen[nseen].n = size, seen[nseen++].prog = prog;
+            rt_log("vk_exec: OOT_WB_WATCH: range %#llx+%#llx written by program %llu (frame %llu)", (unsigned long long)addr,
+                   (unsigned long long)size, (unsigned long long)prog, (unsigned long long)gfx_counters.frames);
+        }
+    }
     gw_add(addr, size);
+    rb_written(addr, size, ex->fence);
     CbRes *r = cb_res(ex);
     for (int i = 0; i < r->nwritten; i++)
         if (r->written[i].addr == addr && r->written[i].size == size) return;
@@ -739,7 +830,7 @@ int vk_exec_find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, cons
 // Texture and image types of a stage's first 32 slots, each kept with the handle and the generation and slot token it
 // was looked up under: a slot is looked up again, a hash probe, only when the handle changed or its slot may resolve
 // otherwise (slot_still).
-static struct { uint64_t tex[32], img[32], ttok[32], itok[32]; uint32_t tgen[32], igen[32]; uint8_t tt[32], it[32]; } AC[NVN_STAGES];
+static struct { uint64_t tex[32], img[32], ttok[32], itok[32]; uint32_t tgen[32], igen[32]; uint8_t tt[32], it[32], ifmt[32]; } AC[NVN_STAGES];
 
 // vk_texture_slot_token of the slot a texture or image handle names; an empty handle always resolves to nothing.
 static uint64_t token_of(uint64_t h) { return h ? vk_texture_slot_token((int)(h & 0xfffff)) : 1; }
@@ -816,6 +907,43 @@ static uint8_t type_of_handle(uint64_t h) {   // texture lock held
     return (uint8_t)(gfx_type_of(img, &v, hv) | cls);
 }
 
+// The image format answer (GfxShaderAnswers.img_format, Ryujinx's TextureFormat order) of an image handle whose view
+// is an integer format, 0 otherwise (the translator's default): its stores and loads must go through an integer image
+// of that format.
+static uint8_t img_format_of_handle(uint64_t h) {   // texture lock held
+    view_t v;
+    int hv;
+    const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
+    if (!img) return 0;
+    VkFormat f = img->format;
+    if (hv && v.set_format) {
+        TexVkFormat vf;
+        if (tex_vk_format(v.format, &vf) && vf.vk != VK_FORMAT_UNDEFINED) f = vf.vk;
+    }
+    switch (f) {
+    case VK_FORMAT_R8_UINT: return 3;
+    case VK_FORMAT_R8_SINT: return 4;
+    case VK_FORMAT_R16_UINT: return 8;
+    case VK_FORMAT_R16_SINT: return 9;
+    case VK_FORMAT_R32_UINT: return 11;
+    case VK_FORMAT_R32_SINT: return 12;
+    case VK_FORMAT_R8G8_UINT: return 15;
+    case VK_FORMAT_R8G8_SINT: return 16;
+    case VK_FORMAT_R16G16_UINT: return 20;
+    case VK_FORMAT_R16G16_SINT: return 21;
+    case VK_FORMAT_R32G32_UINT: return 23;
+    case VK_FORMAT_R32G32_SINT: return 24;
+    case VK_FORMAT_R8G8B8A8_UINT: return 27;
+    case VK_FORMAT_R8G8B8A8_SINT: return 28;
+    case VK_FORMAT_R16G16B16A16_UINT: return 32;
+    case VK_FORMAT_R16G16B16A16_SINT: return 33;
+    case VK_FORMAT_R32G32B32A32_UINT: return 35;
+    case VK_FORMAT_R32G32B32A32_SINT: return 36;
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 38;
+    default: return 0;
+    }
+}
+
 // The answers of stage st for the slots in mask; the types of other slots stay zero.
 static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, GfxShaderAnswers *a) {
     memset(a, 0, sizeof *a);
@@ -845,10 +973,10 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
         uint64_t tt = tmiss ? token_of(h) : 0, it = imiss ? token_of(hi) : 0;
         if ((tmiss || imiss || check) && !locked) vk_texture_lock(), locked = 1, BS.ac_miss++;
         if (tmiss) c->tt[slot] = type_of_handle(h), c->tex[slot] = h, c->ttok[slot] = tt, c->tgen[slot] = gen;
-        if (imiss) c->it[slot] = type_of_handle(hi), c->img[slot] = hi, c->itok[slot] = it, c->igen[slot] = gen;
+        if (imiss) c->it[slot] = type_of_handle(hi), c->ifmt[slot] = img_format_of_handle(hi), c->img[slot] = hi, c->itok[slot] = it, c->igen[slot] = gen;
         if (check && (type_of_handle(h) != c->tt[slot] || type_of_handle(hi) != c->it[slot]))   // OOT_SHADER_MEMO=check
             rt_fatal("vk_exec: kept texture types of stage %d slot %d differ from a lookup", st, slot);
-        a->tex_type[slot] = c->tt[slot], a->img_type[slot] = c->it[slot];
+        a->tex_type[slot] = c->tt[slot], a->img_type[slot] = c->it[slot], a->img_format[slot] = c->ifmt[slot];
     }
     if (locked) vk_texture_unlock();
 }
@@ -1015,7 +1143,7 @@ static int c0_on(void) {   // OOT_FIX_C0=0: c0 reads zeros instead of the driver
 // slots, image handles (u64) for control[0xb6] slots (measured on the upscaler's kernels, docs/phase3.md
 // 2026-11-06: a kernel with a 0x54-byte push, 3 storage slots, 4 texture slots and 2 image slots reads its storage
 // slot 2 at 0x90, textures 0 and 3 at 0xa0 and 0xb8, image 1 at 0xc8; one with no push reads slots 0 and 1 at 0x10
-// and 0x20). The push is consumed by the next dispatch. The uniform table (2026-11-07, from Hookshot's
+// and 0x20). The push stays until the next push (OP_DISPATCH in vk_exec_op). The uniform table (2026-11-07, from Hookshot's
 // gpu/vk/vk_bank.cpp cs_layout, read for behaviour only): ace1cec0, the level's 1.5 s kernel, has six uniform slots,
 // no push and its tables at 0x10-0x98; with the uniform table left zero its loops read their bounds through null.
 static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *nu, uint32_t *ns, uint32_t *nt, uint32_t *ni) {
@@ -3192,7 +3320,10 @@ static void cst_end(VkExec *ex, int pair, const GfxShader *cs, const uint32_t gr
 //   the picture is too, build/logs/skip-3f15.png).
 // ace1cec0 runs again since 2026-11-08 night: with the culling counts and the mesh count fixed, the level route shows
 // no blocks and no black scene with it (build/logs/ace-on-level.png), at under 0.2 ms a dispatch.
-#define SKIP_CS_DEFAULT "3f15911a"
+// 3f15911a runs again since 2026-11-10: it sampled its RG16UI input through a float sampler (NVN2 handles had no type
+// answers) and its mask came out empty or wrong; with the types answered and 3ce2b98c storing, the Kokiri Forest route
+// shows no white patches (build/logs/out-sheet-9e5.jpg).
+#define SKIP_CS_DEFAULT ""
 static int skip_cs(const GfxShader *cs) {
     const char *e = getenv("OOT_SKIP_CS");
     if (!e) e = SKIP_CS_DEFAULT;
@@ -3551,22 +3682,24 @@ enum { IND_SLOTS = 256 };
 static VkBuffer ind_buf;
 static VmaAllocation ind_mem;
 static uint32_t *ind_map, ind_next;
-typedef struct { uint32_t slot; char hex[17]; } IndRead;
+typedef struct { uint32_t slot; char hex[17]; uint64_t addr; } IndRead;
 static void ind_read(void *arg) {
     IndRead *r = arg;
     static volatile LONG n;
     if (InterlockedIncrement(&n) <= 200) {
         const uint32_t *v = ind_map + 4 * r->slot;
         const uint32_t *lim = vk_ctx()->props.limits.maxComputeWorkGroupCount;
-        rt_log("vk_exec: OOT_IND_LOG: indirect dispatch of %s: %u x %u x %u groups%s", r->hex, v[0], v[1], v[2],
+        rt_log("vk_exec: OOT_IND_LOG: indirect dispatch of %s at %#llx: %u x %u x %u groups%s", r->hex, (unsigned long long)r->addr, v[0], v[1], v[2],
                v[0] > lim[0] || v[1] > lim[1] || v[2] > lim[2] ? " (over the device's limit)" : "");
     }
     free(r);
 }
-static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
+static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs, uint64_t addr) {
     static int on = -1;
+    static uint64_t from;   // OOT_IND_LOG=<frame>: from that frame on
     if (on < 0) {
         on = getenv("OOT_IND_LOG") != NULL;
+        if (on) from = strtoull(getenv("OOT_IND_LOG"), NULL, 10);
         if (on) {
             VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = IND_SLOTS * 16,
                                      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -3578,7 +3711,7 @@ static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
             else on = 0;
         }
     }
-    if (!on) return;
+    if (!on || gfx_counters.frames < from) return;
     uint32_t slot = ind_next++ % IND_SLOTS;
     VkBufferCopy cp = {ip->offset, (VkDeviceSize)slot * 16, 12};
     vkCmdCopyBuffer(ex->cb, ip->buffer, ind_buf, 1, &cp);
@@ -3586,7 +3719,7 @@ static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
     vk_exec_barrier(ex);
     IndRead *r = malloc(sizeof *r);
     if (!r) return;
-    r->slot = slot;
+    r->slot = slot, r->addr = addr;
     const uint8_t *id = gfx_shader_input_id(cs);
     for (int i = 0; i < 8; i++) snprintf(r->hex + 2 * i, 3, "%02x", id[i]);
     vk_completion_add(ex->fence, ind_read, r);
@@ -3795,13 +3928,25 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         vk_exec_barrier(ex);
         B.c0_valid[2] = 0;   // the range no longer holds B.c0[2]
     }
-    ind_log(ex, &ip, cs);
+    ind_log(ex, &ip, cs, d->ind);
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
     ex->recorded++;
     cr_after_dispatch(ex, 0xffffffffu, 0, 0);   // indirect
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
     VK_MEM_BOUND(ip);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, &(p_dispatch){0, 0, 0, d->caller});
+}
+
+// In a frame dump: the constants pushed for the next dispatch (bank 0 from +0x10), as words.
+static void push_cc_dump(const VkExec *ex) {
+    if (!vk_dump_armed || !ex->push_cc_len) return;
+    char line[2200], *o = line;
+    for (uint32_t i = 0; i + 4 <= ex->push_cc_len && i < 0x200; i += 4) {
+        uint32_t w;
+        memcpy(&w, ex->push_cc + i, 4);
+        o += sprintf(o, " %08x", w);
+    }
+    vk_dump_note("pushed constants of the next dispatch (%u bytes, bank 0 +0x10):%s", ex->push_cc_len, line);
 }
 
 // OP_PUSH_CC (NVN2 nvnCommandBufferPushComputeConstants): the pushed bytes into the compute stage's block, which
@@ -3994,8 +4139,12 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_UPDATE_UB: op_update_ub(ex, payload); break;
     case OP_PUSH_CC: op_push_cc(ex, payload); break;
     case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_IND: op_draw_ptr(ex, op, payload); break;
-    case OP_DISPATCH: op_dispatch_ptr(ex, payload, 0); ex->push_cc_len = 0; break;   // the push is consumed (NVN2)
-    case OP_DISPATCH_IND: op_dispatch_ptr(ex, payload, 1); ex->push_cc_len = 0; break;
+    // The pushed constants stay for the dispatches that follow, until the next push: the game pushes once for the
+    // end-of-frame chain (745220f3, 3f15911a, 3ce2b98c). While a dispatch consumed them here, 3ce2b98c read 0 for its
+    // bounds (bank 0 +0x68, +0x6c) and stored no texel: the upscaler then squared colour that was never square-rooted
+    // (crushed shadows, blown highlights; 2026-11-10, build/logs/dump-91).
+    case OP_DISPATCH: push_cc_dump(ex); op_dispatch_ptr(ex, payload, 0); break;
+    case OP_DISPATCH_IND: push_cc_dump(ex); op_dispatch_ptr(ex, payload, 1); break;
     case OP_DRAW_MESH: op_draw_mesh_ptr(ex, payload); break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }

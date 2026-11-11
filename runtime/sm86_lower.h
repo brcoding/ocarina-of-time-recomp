@@ -40,6 +40,10 @@ typedef struct {
     uint32_t stage;            // NVN's enum at byte +0x56: 0 vertex, 1 fragment, 2 geometry, 3 tess control,
                                // 4 tess eval, 5 compute, 6 task, 7 mesh
     uint32_t local[3];         // compute: the workgroup size (+0x58)
+    // compute: the bank-0 byte offsets of the texture and image handle tables and their slot counts (0: unknown), from
+    // the slot counts at +0xb1 (uniform), +0xb2 (storage), +0xb3 (texture), +0xb6 (image) and the tables' end at +0xba
+    // (vk_exec_draw.c nvn2_cs_layout has the measurements)
+    uint32_t tab_tex, ntex, tab_img, nimg;
 } Sm86Control;
 // 0 when the magic or the bounds are wrong.
 int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Control *c);

@@ -548,8 +548,11 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
                    size > 8 ? w[2] : 0, size > 12 ? w[3] : 0);
         }
     }
-    if (rb_wait && gfx_replay_async() && vk_gpu_wrote_pages(addr, size)) {
-        uint64_t f = vk_sync_latest();
+    // Readback ranges (vk_exec_draw.c): the read waits for the newest recorded submission that writes the range; with
+    // the replay queued, work that writes it may not be recorded yet, so for everything handed over.
+    int rb_range = !rb_wait && vk_gpu_wrote_pages(addr, size) && vk_readback_note(addr, size);
+    if ((rb_wait && gfx_replay_async() && vk_gpu_wrote_pages(addr, size)) || rb_range) {
+        uint64_t f = rb_range && !gfx_replay_async() ? vk_readback_fence(addr, size) : vk_sync_latest();
         if (f && vk_sync_fence_done() < f) {
             uint64_t t0 = kern_now_ns();
             NVN_BLOCKING();

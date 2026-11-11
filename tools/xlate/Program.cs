@@ -91,16 +91,33 @@ static class SwshXlate
         {
             (int off0, _, _) = TextureHandle.UnpackOffsets(handle);
             int bytes = off0 * 4;
+            // NVN2 compute kernels read their handles from bank 0, in the driver's tables of the bound slots: the job's
+            // "nvn2" object says where the texture and the image table start and how many slots each has
+            // (runtime/sm86_lower.c sm86_control_parse).
+            if (cbufSlot >= 0 && (cbufSlot & 0xffff) == 0 && bytes % 8 == 0 && _job["nvn2"] is JsonObject n2)
+            {
+                int tb = (int)n2["tex"], nt = (int)n2["ntex"], ib = (int)n2["img"], ni = (int)n2["nimg"];
+                if (bytes >= tb && bytes < tb + 8 * nt) return (bytes - tb) / 8 < 32 ? (bytes - tb) / 8 : -1;
+                if (bytes >= ib && bytes < ib + 8 * ni) return (bytes - ib) / 8 < 32 ? (bytes - ib) / 8 : -1;
+                return -1;
+            }
             if (!(cbufSlot < 0 || (cbufSlot & 0xffff) == 2) || bytes % 8 != 0) return -1;
             if (bytes >= 0x20 && bytes < 0x120) return (bytes - 0x20) / 8;
             if (bytes >= 0x120 && bytes < TexBase) return (bytes - 0x120) / 8;
             return bytes >= TexBase && bytes < SampBase ? (bytes - TexBase) / 8 : -1;
         }
+        // An NVN2 handle in bank 0's image table: its slot is an image slot (the "img" table), not a texture slot.
+        bool Nvn2Img(int handle, int cbufSlot)
+        {
+            (int off0, _, _) = TextureHandle.UnpackOffsets(handle);
+            return cbufSlot >= 0 && (cbufSlot & 0xffff) == 0 && _job["nvn2"] is JsonObject n2 && off0 * 4 >= (int)n2["img"];
+        }
         public SamplerType QuerySamplerType(int handle, int cbufSlot = -1)
         {
             int slot = TexSlot(handle, cbufSlot);
-            if (slot >= 0) TexQueried.Add(slot);
-            string t = slot >= 0 ? Get("tex", slot) ?? Get("img", slot) : null;
+            bool img = Nvn2Img(handle, cbufSlot);
+            if (slot >= 0) (img ? ImgQueried : TexQueried).Add(slot);
+            string t = slot >= 0 ? (img ? Get("img", slot) : Get("tex", slot) ?? Get("img", slot)) : null;
             if (t == null) { Notes.Add($"贴图句柄 {handle:X}（常量段 {cbufSlot}，槽 {slot}）无 PC 类型，按 2D"); return SamplerType.Texture2D; }
             if (t.EndsWith("_depth")) t = t.Substring(0, t.Length - 6);   // depth-format texture: same sampler type here; the host binds a depth view
             if (t.EndsWith("_uint") || t.EndsWith("_sint")) t = t.Substring(0, t.Length - 5);   // integer texture (QuerySamplerFormat)
@@ -118,6 +135,7 @@ static class SwshXlate
         public TextureFormat QuerySamplerFormat(int handle, int cbufSlot = -1)
         {
             int slot = TexSlot(handle, cbufSlot);
+            if (slot >= 0 && Nvn2Img(handle, cbufSlot)) return TextureFormat.Unknown;
             if (slot >= 0) TexQueried.Add(slot);
             string t = slot >= 0 ? Get("tex", slot) : null;
             if (t == null) return TextureFormat.Unknown;

@@ -52,6 +52,13 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
     memcpy(&c->code_size, control + 0x44, 4);
     c->stage = control[0x56];
     memcpy(c->local, control + 0x58, 12);
+    c->tab_tex = c->ntex = c->tab_img = c->nimg = 0;
+    if (c->stage == 5) {
+        uint32_t nu = control[0xb1], ns = control[0xb2], nt = control[0xb3], ni = control[0xb6];
+        uint32_t end = (uint32_t)control[0xba] | (uint32_t)control[0xbb] << 8, tables = 16 * nu + 16 * ns + 8 * nt + 8 * ni;
+        if (end >= 0x10 + tables && end <= 0x800)
+            c->tab_tex = end - 8 * ni - 8 * nt, c->ntex = nt, c->tab_img = end - 8 * ni, c->nimg = ni;
+    }
     if (c->size < SM86_CONTROL_MIN || c->size > control_size) c->size = SM86_CONTROL_MIN;
     uint32_t header = c->stage == 5 ? 0 : SM86_HEADER;
     if (c->stage > 7 || c->code_end <= header || c->code_end % 16 || c->c1_off < c->code_end ||

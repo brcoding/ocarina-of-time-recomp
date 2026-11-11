@@ -1,0 +1,17 @@
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/ShaderProperties.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/ShaderProperties.cs
+@@ -70,7 +70,13 @@
+             // specify a format, we can just declare it without a format and the GPU will handle it.
+             if (gpuAccessor.QueryHostSupportsImageLoadFormatted())
+             {
+-                return TextureFormat.Unknown;
++                // OoT (2026-11-10): an image without a format is declared with a float component type, and stores of
++                // a float vector into an integer view are dropped (NVIDIA): the end-of-frame kernel that packs its
++                // texels itself and stores them through an R32UI view of the R11G11B10F target wrote nothing. An
++                // integer format the host answers is declared, so the image gets its integer component type.
++                TextureFormat known = gpuAccessor.QueryTextureFormat(handle, cbufSlot);
++
++                return known.GetComponentType() is Translation.AggregateType.S32 or Translation.AggregateType.U32 ? known : TextureFormat.Unknown;
+             }
+ 
+             TextureFormat format = gpuAccessor.QueryTextureFormat(handle, cbufSlot);

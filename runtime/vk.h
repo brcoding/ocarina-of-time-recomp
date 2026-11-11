@@ -393,6 +393,10 @@ uint64_t vk_sync_latest(void);             // newest value handed out or submitt
 // Pages of buffers a shader wrote (vk_exec_draw.c note_written): 1 when [addr, addr+size) touches one. For the CPU's
 // reads of GPU results after an invalidate (vk_backend.c guest_read).
 int vk_gpu_wrote_pages(uint64_t addr, uint64_t size);
+// Readback ranges (vk_exec_draw.c): GPU results the CPU reads and then writes again, as the game's exposure meter.
+int vk_readback_note(uint64_t addr, uint64_t size);        // the CPU read one (guest_read); 1 when it is kept
+uint64_t vk_readback_fence(uint64_t addr, uint64_t size);  // the newest submission recorded that writes it, 0 none
+int vk_readback_ranges(uint64_t lo, uint64_t hi, uint64_t out[][2], int cap);   // those inside [lo, hi), for the mirror refresh
 void vk_sync_finish(void);                 // every submitted value done
 void vk_sync_shutdown(void);               // finish, stop the completion thread, free the command buffers
 // The op-stream replay (vk_exec.c): records the command handles of one submission into cb, which the caller has
